@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -444,7 +445,10 @@ func (s *Service) serveDecompressedNarinfo(w http.ResponseWriter, obj *minio.Obj
 		contentEncoding = info.Metadata.Get("X-Amz-Meta-Content-Encoding")
 	}
 
-	if strings.EqualFold(contentEncoding, "zstd") {
+	// Some S3 implementations drop the Content-Encoding header on stored
+	// objects, so also recognise a zstd frame by its magic number.
+	zstdMagic := []byte{0x28, 0xb5, 0x2f, 0xfd}
+	if strings.EqualFold(contentEncoding, "zstd") || bytes.HasPrefix(data, zstdMagic) {
 		decoder, ok := zstdDecoderPool.Get().(*zstd.Decoder)
 		if !ok {
 			slog.Error("Failed to get zstd decoder from pool")
