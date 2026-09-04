@@ -1,0 +1,63 @@
+name: Build and push image to qcr
+on:
+  push:
+    branches:
+      - main
+    tags:
+      # Dated snapshot tags (e.g. 2026.09.04) pushed by
+      # Qumulo/repository-updater after each sync with upstream.
+      - "2*.*.*"
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      REGISTRY: qcr.corp.qumulo.com
+      IMAGE: qcr.corp.qumulo.com/engineering/niks3
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+      - name: Setup Nix
+        uses: cachix/install-nix-action@v31
+      - name: Build Docker image
+        run: |
+          nix build .#niks3-docker --print-build-logs
+      - name: Connect to tailnet
+        # qcr.corp.qumulo.com is only reachable from inside the corp network.
+        # tailscale comes from nixpkgs (pinned by flake.lock) rather than
+        # tailscale/github-action, whose run-time download from
+        # pkgs.tailscale.com took out qompass dev deploys during that CDN's
+        # 2026-07-16 outage. The OAuth client secret is accepted directly as an
+        # auth key (?ephemeral&preauthorized) for the client's tags. Ephemeral +
+        # mem: state, so the node evaporates when the runner dies.
+        env:
+          TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
+        run: |
+          set -xe
+          TS="$(nix build --inputs-from . nixpkgs#tailscale --no-link --print-out-paths)"
+          sudo setsid nohup bash -c "exec '$TS/bin/tailscaled' --state=mem:" \
+            >/tmp/tailscaled.log 2>&1 &
+          for i in $(seq 1 30); do
+            [ -S /var/run/tailscale/tailscaled.sock ] && break
+            if [ "$i" = 30 ]; then echo "tailscaled did not start:"; cat /tmp/tailscaled.log; exit 1; fi
+            sleep 1
+          done
+          timeout 120 sudo "$TS/bin/tailscale" up \
+            --auth-key="${TS_OAUTH_SECRET}?ephemeral=true&preauthorized=true" \
+            --advertise-tags=tag:github-qumulo \
+            --accept-routes --accept-dns=true \
+            --hostname="gh-niks3-${GITHUB_RUN_ID}"
+          sudo "$TS/bin/tailscale" status --self=true --peers=false
+      - name: Push image
+        env:
+          QCR_USERNAME: ${{ secrets.QCR_USERNAME }}
+          QCR_SECRET: ${{ secrets.QCR_SECRET }}
+        run: |
+          set -xe
+          PATH="$(nix build --inputs-from . nixpkgs#regctl --print-out-paths --no-link)/bin:$PATH"
+          regctl registry login "$REGISTRY" -u "$QCR_USERNAME" --pass-stdin <<< "$QCR_SECRET"
+          regctl image import "ocidir://local:niks3" ./result
+          regctl image copy "ocidir://local:niks3" "$IMAGE:${GITHUB_REF_NAME}"
