@@ -54,7 +54,11 @@ func NewStreamPusher(push StreamPushFunc, parallel, batchSize int) *StreamPusher
 	return &StreamPusher{push: push, parallel: parallel, batchSize: batchSize}
 }
 
-// Run returns after EOF on `in` once every path was reported on `out`.
+// Run returns after EOF on `in` once every path was reported on `out`, or
+// as soon as ctx ends, with ctx.Err(). In the latter case paths still in
+// flight are reported as errors and paths not yet read are left
+// unreported; the error tells the driver the run was cut short. A reader
+// blocked in `in` cannot be interrupted and is abandoned to process exit.
 func (s *StreamPusher) Run(ctx context.Context, in io.Reader, out io.Writer) error {
 	lines := make(chan string, s.batchSize*s.parallel)
 	readErr := make(chan error, 1)
@@ -64,8 +68,15 @@ func (s *StreamPusher) Run(ctx context.Context, in io.Reader, out io.Writer) err
 
 		sc := bufio.NewScanner(in)
 		for sc.Scan() {
-			if p := strings.TrimSpace(sc.Text()); p != "" {
-				lines <- p
+			p := strings.TrimSpace(sc.Text())
+			if p == "" {
+				continue
+			}
+
+			select {
+			case lines <- p:
+			case <-ctx.Done():
+				return
 			}
 		}
 
@@ -91,15 +102,29 @@ func (s *StreamPusher) Run(ctx context.Context, in io.Reader, out io.Writer) err
 
 	slots := make(chan struct{}, s.parallel)
 
+loop:
 	for {
-		first, ok := <-lines
-		if !ok {
-			break
+		var (
+			first string
+			ok    bool
+		)
+
+		select {
+		case first, ok = <-lines:
+			if !ok {
+				break loop
+			}
+		case <-ctx.Done():
+			break loop
 		}
 
 		batch := append(make([]string, 0, s.batchSize), first)
 
-		slots <- struct{}{}
+		select {
+		case slots <- struct{}{}:
+		case <-ctx.Done():
+			break loop
+		}
 
 	fill:
 		for len(batch) < s.batchSize {
@@ -123,6 +148,10 @@ func (s *StreamPusher) Run(ctx context.Context, in io.Reader, out io.Writer) err
 	}
 
 	wg.Wait()
+
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("stopped before stdin ended: %w", err)
+	}
 
 	if err := <-readErr; err != nil {
 		return fmt.Errorf("reading paths: %w", err)
