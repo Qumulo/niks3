@@ -69,7 +69,11 @@ func NewStreamPusher(push StreamPushFunc, parallel, batchSize int) *StreamPusher
 	return &StreamPusher{push: push, parallel: parallel, batchSize: batchSize}
 }
 
-// Run returns after EOF on `in` once every path was reported on `out`.
+// Run returns after EOF on `in` once every path was reported on `out`, or
+// as soon as ctx ends, with ctx.Err(). In the latter case paths still in
+// flight are reported as errors and paths not yet read are left
+// unreported; the error tells the driver the run was cut short. A reader
+// blocked in `in` cannot be interrupted and is abandoned to process exit.
 func (s *StreamPusher) Run(ctx context.Context, in io.Reader, out io.Writer) error {
 	lines := make(chan string, s.batchSize*s.parallel)
 	readErr := make(chan error, 1)
@@ -81,8 +85,15 @@ func (s *StreamPusher) Run(ctx context.Context, in io.Reader, out io.Writer) err
 		sc.Buffer(nil, maxRequestLine)
 
 		for sc.Scan() {
-			if p := strings.TrimSpace(sc.Text()); p != "" {
-				lines <- p
+			p := strings.TrimSpace(sc.Text())
+			if p == "" {
+				continue
+			}
+
+			select {
+			case lines <- p:
+			case <-ctx.Done():
+				return
 			}
 		}
 
@@ -107,35 +118,54 @@ func (s *StreamPusher) Run(ctx context.Context, in io.Reader, out io.Writer) err
 	}
 
 	slots := make(chan struct{}, s.parallel)
-	submit := func(job func() []StreamResult) {
-		slots <- struct{}{}
+	submit := func(job func() []StreamResult) bool {
+		select {
+		case slots <- struct{}{}:
+		case <-ctx.Done():
+			return false
+		}
 
 		wg.Go(func() {
 			defer func() { <-slots }()
 
 			report(job())
 		})
+
+		return true
 	}
 
 	batch := make([]string, 0, s.batchSize)
-	flush := func() {
-		if len(batch) > 0 {
-			b := batch
-			batch = make([]string, 0, s.batchSize)
-
-			submit(func() []StreamResult { return s.upload(ctx, b) })
+	flush := func() bool {
+		if len(batch) == 0 {
+			return true
 		}
+
+		b := batch
+		batch = make([]string, 0, s.batchSize)
+
+		return submit(func() []StreamResult { return s.upload(ctx, b) })
 	}
 
+loop:
 	for {
-		line, ok := <-lines
-		if !ok {
-			break
+		var (
+			line string
+			ok   bool
+		)
+
+		select {
+		case line, ok = <-lines:
+			if !ok {
+				break loop
+			}
+		case <-ctx.Done():
+			break loop
 		}
 
 		if strings.HasPrefix(line, "{") {
-			flush()
-			submit(func() []StreamResult { return s.uploadRequest(ctx, line) })
+			if !flush() || !submit(func() []StreamResult { return s.uploadRequest(ctx, line) }) {
+				break loop
+			}
 
 			continue
 		}
@@ -143,13 +173,19 @@ func (s *StreamPusher) Run(ctx context.Context, in io.Reader, out io.Writer) err
 		batch = append(batch, line)
 		// Flush when full or when stdin has nothing more ready.
 		if len(batch) == s.batchSize || len(lines) == 0 {
-			flush()
+			if !flush() {
+				break loop
+			}
 		}
 	}
 
 	flush()
 
 	wg.Wait()
+
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("stopped before stdin ended: %w", err)
+	}
 
 	if err := <-readErr; err != nil {
 		return fmt.Errorf("reading paths: %w", err)
