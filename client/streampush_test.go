@@ -195,6 +195,95 @@ func TestStreamPushIsolatesFailures(t *testing.T) {
 	}
 }
 
+// A driver that keeps stdin open must not keep `niks3 push --stdin` alive
+// after SIGTERM; Run has to return with the context's error.
+func TestStreamPushStopsWhenCancelled(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	inR, inW := io.Pipe() // never closed, like a driver that is still running
+
+	var (
+		started sync.Once
+		pushing = make(chan struct{})
+	)
+
+	push := func(ctx context.Context, _ []string, _ int64) ([]string, error) { //nolint:unparam // StreamPushFunc signature
+		started.Do(func() { close(pushing) })
+
+		<-ctx.Done()
+
+		return nil, ctx.Err()
+	}
+
+	var out safeBuffer
+
+	done := make(chan error, 1)
+
+	go func() {
+		done <- client.NewStreamPusher(push, 1, 10).Run(ctx, inR, &out)
+	}()
+
+	_, _ = io.WriteString(inW, "/nix/store/a\n/nix/store/b\n")
+
+	<-pushing
+
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run returned %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancellation")
+	}
+
+	var reported []result
+
+	for line := range strings.SplitSeq(strings.TrimSpace(out.String()), "\n") {
+		if line == "" {
+			continue
+		}
+
+		var r result
+		if err := json.Unmarshal([]byte(line), &r); err != nil {
+			t.Fatalf("bad output line %q: %v", line, err)
+		}
+
+		reported = append(reported, r)
+	}
+
+	for _, r := range reported {
+		if r.Status != "error" {
+			t.Errorf("%s: status %s, want error after cancellation", r.Path, r.Status)
+		}
+	}
+}
+
+type safeBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (s *safeBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	n, _ := s.b.Write(p) // strings.Builder never fails
+
+	return n, nil
+}
+
+func (s *safeBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.b.String()
+}
+
 func TestStreamPushGivesUpOnDeadServer(t *testing.T) {
 	t.Parallel()
 
