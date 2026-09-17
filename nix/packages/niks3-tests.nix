@@ -18,6 +18,9 @@ pkgs.buildGoModule {
     inherit (common) root;
     fileset = lib.fileset.unions [
       common.commonFiles
+      # The golangci-lint check is built from this package; without the
+      # config it lints with the standard default set and finds nothing.
+      ../../.golangci.yml
       common.srcs.api
       common.srcs.client
       common.srcs.cmdutil
