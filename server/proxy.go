@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
@@ -28,6 +29,19 @@ const (
 	// proxyTimeoutSlack absorbs TLS handshake, S3 first-byte latency, and
 	// TCP slow start. Dominates for small objects (narinfos, listings).
 	proxyTimeoutSlack = 5 * time.Minute
+
+	// proxyDecompressRatio is how much larger than its stored size a
+	// decompressed object is assumed to be when its write budget is set;
+	// text (build logs, JSON) compresses well.
+	proxyDecompressRatio = 10
+
+	// proxyDecompressHead is how much of a decompressed object is read
+	// before the response headers are sent, so a corrupt frame still gets
+	// a 502 rather than a truncated 200. It covers a whole narinfo.
+	proxyDecompressHead = 64 << 10
+
+	// zstdMagic starts every zstd frame.
+	zstdMagic = "\x28\xb5\x2f\xfd"
 )
 
 // ProxyWriteTimeout returns the per-request write deadline for streaming an
@@ -166,6 +180,15 @@ var (
 	realisationsRe = regexp.MustCompile(`^realisations/[a-z0-9]+:[a-zA-Z0-9+/=]+![a-zA-Z0-9+._?=-]+\.doi$`)
 )
 
+// servesDecompressed reports whether key is one of the objects niks3
+// stores zstd-compressed with a Content-Encoding and Nix reads as plain
+// bytes: narinfos, listings, build logs and realisations. NARs are
+// compressed by Nix itself and served verbatim.
+func servesDecompressed(key string) bool {
+	return narinfoRe.MatchString(key) || lsRe.MatchString(key) ||
+		logRe.MatchString(key) || realisationsRe.MatchString(key)
+}
+
 // IsValidCachePath checks whether a path matches a known Nix binary cache object pattern.
 // It rejects path traversal, leading slashes, and any pattern outside the allowlist.
 func IsValidCachePath(path string) bool {
@@ -295,13 +318,13 @@ func (s *Service) handleProxyHead(w http.ResponseWriter, r *http.Request, key st
 
 	setProxyHeaders(w, key, &objInfo)
 
-	// For narinfos we decompress on GET, so the compressed Content-Length
-	// from S3 would be wrong. Omit it — HTTP allows HEAD without Content-Length.
-	if !strings.HasSuffix(key, ".narinfo") {
+	// Objects we decompress on GET have a different length than S3
+	// reports. Omit it: HTTP allows HEAD without Content-Length.
+	if servesDecompressed(key) {
+		w.Header().Set("Content-Type", proxyContentType(key, ""))
+	} else {
 		w.Header().Set("Accept-Ranges", "bytes")
 		w.Header().Set("Content-Length", strconv.FormatInt(objInfo.Size, 10))
-	} else {
-		w.Header().Set("Content-Type", "text/x-nix-narinfo")
 	}
 
 	w.WriteHeader(http.StatusOK)
@@ -336,15 +359,16 @@ func (s *Service) handleProxyGet(w http.ResponseWriter, r *http.Request, key str
 		}
 	}
 
-	isNarinfo := strings.HasSuffix(key, ".narinfo")
+	decompress := servesDecompressed(key)
 
 	// Range support is for resuming large NAR downloads on flaky links. We
 	// translate the Range header into an S3 range request rather than using
 	// http.ServeContent: the latter seeks within minio.Object, which aborts
-	// and re-issues the underlying S3 stream.
+	// and re-issues the underlying S3 stream. Objects served decompressed
+	// have no stable byte offsets, so a Range on them is ignored.
 	var rng *byteRange
 
-	if !isNarinfo {
+	if !decompress {
 		var rangeErr error
 
 		rng, rangeErr = parseSingleRange(r.Header.Get("Range"), objInfo.Size)
@@ -387,10 +411,8 @@ func (s *Service) handleProxyGet(w http.ResponseWriter, r *http.Request, key str
 
 	s.S3RateLimiter.RecordSuccess()
 
-	// Narinfos are stored zstd-compressed in S3, but Nix's HTTP binary cache
-	// client expects plain text. Decompress on the fly (narinfos are ~500 bytes).
-	if isNarinfo {
-		s.serveDecompressedNarinfo(w, obj, &objInfo)
+	if decompress {
+		s.serveDecompressed(w, key, obj, &objInfo)
 
 		return
 	}
@@ -419,36 +441,34 @@ func (s *Service) handleProxyGet(w http.ResponseWriter, r *http.Request, key str
 	}
 }
 
-// serveDecompressedNarinfo reads a narinfo from S3 and writes the decompressed
-// content to the response. Narinfos are tiny (~500 bytes compressed) so
-// buffering the whole thing is fine.
+// serveDecompressed streams an object niks3 stores zstd-compressed with a
+// Content-Encoding (narinfos, listings, build logs, realisations) as the
+// plain bytes Nix expects. Nix's curl would decode a Content-Encoding
+// itself, but only when its libcurl was built with zstd, and some S3
+// implementations drop the header on stored objects, so decompressing
+// here is the robust choice.
 //
-// Narinfos are stored zstd-compressed in S3 with Content-Encoding: zstd.
-// A transparent proxy (e.g. Cloudflare Tunnel) may decompress the data and
-// strip the Content-Encoding header before it reaches us. We only decompress
-// when the Content-Encoding header is still present.
-func (s *Service) serveDecompressedNarinfo(w http.ResponseWriter, obj *minio.Object, info *minio.ObjectInfo) {
-	data, err := io.ReadAll(obj)
-	if err != nil {
-		slog.Error("Failed to read narinfo from S3", "error", err)
+// The stored Content-Encoding is trusted when present; otherwise a zstd
+// frame is recognised by its magic number, which also covers objects a
+// transparent proxy (e.g. Cloudflare Tunnel) already decompressed on the
+// way in. Build logs can be megabytes, so the body is streamed rather
+// than buffered and no Content-Length is sent. The first
+// proxyDecompressHead bytes are decoded before the headers go out, so a
+// corrupt object still answers 502.
+func (s *Service) serveDecompressed(w http.ResponseWriter, key string, obj io.Reader, info *minio.ObjectInfo) {
+	br := bufio.NewReader(obj)
+
+	head, err := br.Peek(len(zstdMagic))
+	if err != nil && !errors.Is(err, io.EOF) {
+		slog.Error("Failed to read object from S3", "key", key, "error", err)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 
 		return
 	}
 
-	plain := data
+	var body io.Reader = br
 
-	// S3 stores Content-Encoding either as a standard header or as user
-	// metadata (X-Amz-Meta-Content-Encoding) depending on the implementation.
-	contentEncoding := info.Metadata.Get("Content-Encoding")
-	if contentEncoding == "" {
-		contentEncoding = info.Metadata.Get("X-Amz-Meta-Content-Encoding")
-	}
-
-	// Some S3 implementations drop the Content-Encoding header on stored
-	// objects, so also recognise a zstd frame by its magic number.
-	zstdMagic := []byte{0x28, 0xb5, 0x2f, 0xfd}
-	if strings.EqualFold(contentEncoding, "zstd") || bytes.HasPrefix(data, zstdMagic) {
+	if strings.EqualFold(storedContentEncoding(info), "zstd") || bytes.HasPrefix(head, []byte(zstdMagic)) {
 		decoder, ok := zstdDecoderPool.Get().(*zstd.Decoder)
 		if !ok {
 			slog.Error("Failed to get zstd decoder from pool")
@@ -456,18 +476,41 @@ func (s *Service) serveDecompressedNarinfo(w http.ResponseWriter, obj *minio.Obj
 
 			return
 		}
-		defer zstdDecoderPool.Put(decoder)
 
-		plain, err = decoder.DecodeAll(data, nil)
-		if err != nil {
-			slog.Error("Failed to decompress narinfo", "error", err)
-			http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		defer func() {
+			// Release the reader before the decoder goes back to the pool.
+			_ = decoder.Reset(nil)
+			zstdDecoderPool.Put(decoder)
+		}()
+
+		if err := decoder.Reset(br); err != nil {
+			slog.Error("Failed to reset zstd decoder", "key", key, "error", err)
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 
 			return
 		}
+
+		body = decoder
 	}
 
-	w.Header().Set("Content-Type", "text/x-nix-narinfo")
+	first := make([]byte, proxyDecompressHead)
+
+	n, err := io.ReadFull(body, first)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		slog.Error("Failed to decompress object", "key", key, "error", err)
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+
+		return
+	}
+
+	// Override the global short WriteTimeout. Only the compressed size is
+	// known; text expands, so budget for the ratio.
+	rc := http.NewResponseController(w)
+	if err := rc.SetWriteDeadline(time.Now().Add(ProxyWriteTimeout(info.Size * proxyDecompressRatio))); err != nil {
+		slog.Debug("Failed to extend write deadline", "key", key, "error", err)
+	}
+
+	w.Header().Set("Content-Type", proxyContentType(key, ""))
 
 	if info.ETag != "" {
 		w.Header().Set("ETag", info.ETag)
@@ -477,9 +520,31 @@ func (s *Service) serveDecompressedNarinfo(w http.ResponseWriter, obj *minio.Obj
 		w.Header().Set("Last-Modified", info.LastModified.UTC().Format(http.TimeFormat))
 	}
 
-	w.Header().Set("Content-Length", strconv.Itoa(len(plain)))
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(plain) //nolint:gosec // G705: narinfo text, never served as HTML
+
+	if _, err := w.Write(first[:n]); err != nil {
+		return
+	}
+
+	if n < len(first) {
+		// The whole object fit in the head.
+		return
+	}
+
+	if _, err := io.Copy(w, body); err != nil {
+		slog.Warn("Failed to stream decompressed object", "key", key, "error", err)
+	}
+}
+
+// storedContentEncoding returns the Content-Encoding S3 kept for an
+// object. Implementations store it either as the standard header or as
+// user metadata (X-Amz-Meta-Content-Encoding), and some drop it.
+func storedContentEncoding(info *minio.ObjectInfo) string {
+	if ce := info.Metadata.Get("Content-Encoding"); ce != "" {
+		return ce
+	}
+
+	return info.Metadata.Get("X-Amz-Meta-Content-Encoding")
 }
 
 // proxyContentType picks the Content-Type for a proxied object. S3's own
