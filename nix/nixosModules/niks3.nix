@@ -222,6 +222,22 @@ let
     "--read-redirect-ttl"
     cfg.readProxy.redirectTTL
   ]
+  ++ lib.concatMap (u: [
+    "--pull-through-upstream"
+    u
+  ]) cfg.readProxy.pullThrough.upstreams
+  ++ lib.concatMap (k: [
+    "--trusted-key"
+    k
+  ]) cfg.readProxy.trustedKeys
+  ++ lib.optionals (cfg.readProxy.pullThrough.upstreams != [ ]) [
+    "--pull-through-negative-ttl"
+    cfg.readProxy.pullThrough.negativeTTL
+    "--pull-through-concurrency"
+    (toString cfg.readProxy.pullThrough.concurrency)
+    "--pull-through-narinfo-concurrency"
+    (toString cfg.readProxy.pullThrough.narinfoConcurrency)
+  ]
   ++ lib.optionals (cfg.cacheUrl != null) [
     "--cache-url"
     cfg.cacheUrl
@@ -501,6 +517,57 @@ in
           the object until it expires.
         '';
       };
+
+      trustedKeys = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        example = [ "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=" ];
+        description = ''
+          Keys one of which must have signed an upstream narinfo for the
+          read proxy to serve and store it. The public keys of
+          {option}`signKeyFiles` are always trusted as well.
+        '';
+      };
+
+      pullThrough = {
+        upstreams = lib.mkOption {
+          type = lib.types.listOf lib.types.str;
+          default = [ ];
+          example = [ "https://cache.nixos.org" ];
+          description = ''
+            Binary caches to fill misses from, tried in order. A narinfo or
+            NAR the bucket lacks is fetched from the first upstream that has
+            it, streamed to the client, stored in the bucket and tracked for
+            garbage collection. Upstream narinfos are stored byte for byte,
+            so their signatures stay valid; clients keep the upstream's key
+            in `trusted-public-keys`. Requires `readProxy.enable`.
+          '';
+        };
+
+        negativeTTL = lib.mkOption {
+          type = lib.types.str;
+          default = "1m";
+          description = "How long an upstream 404 is remembered before asking again.";
+        };
+
+        concurrency = lib.mkOption {
+          type = lib.types.int;
+          default = 16;
+          description = ''
+            Maximum concurrent NAR fills. Each in-flight fill buffers up to
+            one 16 MiB multipart part, so this bounds memory.
+          '';
+        };
+
+        narinfoConcurrency = lib.mkOption {
+          type = lib.types.int;
+          default = 256;
+          description = ''
+            Maximum concurrent narinfo fills. Narinfos are a few KiB, so
+            this bounds upstream connections rather than memory.
+          '';
+        };
+      };
     };
 
     nginx = {
@@ -647,6 +714,17 @@ in
       {
         assertion = !(cfg.s3.useIAM && (cfg.s3.accessKeyFile != null || cfg.s3.secretKeyFile != null));
         message = "s3.useIAM cannot be combined with s3.accessKeyFile / s3.secretKeyFile";
+      }
+      {
+        assertion = cfg.readProxy.pullThrough.upstreams == [ ] || cfg.readProxy.enable;
+        message = "services.niks3.readProxy.pullThrough.upstreams requires readProxy.enable";
+      }
+      {
+        assertion =
+          cfg.readProxy.pullThrough.upstreams == [ ]
+          || cfg.readProxy.trustedKeys != [ ]
+          || cfg.signKeyFiles != [ ];
+        message = "services.niks3.readProxy.pullThrough.upstreams requires readProxy.trustedKeys or signKeyFiles";
       }
     ];
 
