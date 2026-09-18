@@ -283,6 +283,7 @@ func gcCommand(serverURL string, ts client.TokenSource, olderThan, pendingOlderT
 		"Garbage collection completed successfully",
 		"failed-uploads-deleted", stats.FailedUploadsDeleted,
 		"old-closures-deleted", stats.OldClosuresDeleted,
+		"pulled-closures-untrusted", stats.PulledClosuresUntrusted,
 		"objects-marked-for-deletion", stats.ObjectsMarkedForDeletion,
 		"objects-deleted-after-grace-period", stats.ObjectsDeletedAfterGracePeriod,
 		"objects-failed-to-delete", stats.ObjectsFailedToDelete,
