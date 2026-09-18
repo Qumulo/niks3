@@ -120,10 +120,77 @@ WITH RECURSIVE closure_reach AS (
 SELECT DISTINCT key FROM closure_reach;
 
 -- name: DeleteClosures :execrows
--- Delete old closures, but exclude any that are pinned
+-- Delete old closures, uploaded or pulled alike, but exclude any that are
+-- pinned.
 DELETE FROM closures
 WHERE closures.updated_at < $1
   AND closures.key NOT IN (SELECT narinfo_key FROM pins);
+
+-- name: DeletePulledClosuresNotSignedBy :execrows
+-- Expire pull-through closures whose narinfo was verified by a key since
+-- dropped from the trusted set. Keys are matched by name, which is how Nix
+-- identifies them too: rotating a key means a new name (cache.nixos.org-1,
+-- -2), and a replacement key that reuses a name keeps what the old one
+-- vouched for. Pinned closures are kept, as under the other expiries.
+DELETE FROM closures
+WHERE closures.pulled_sig IS NOT NULL
+  AND split_part(closures.pulled_sig, ':', 1) <> ALL($1::text [])
+  AND closures.key NOT IN (SELECT narinfo_key FROM pins);
+
+-- name: CountPinnedPulledClosuresNotSignedBy :one
+-- The pinned closures DeletePulledClosuresNotSignedBy would otherwise have
+-- expired, so the operator can be told a pin is holding one.
+SELECT count(*) FROM closures
+WHERE closures.pulled_sig IS NOT NULL
+  AND split_part(closures.pulled_sig, ':', 1) <> ALL($1::text [])
+  AND closures.key IN (SELECT narinfo_key FROM pins);
+
+-- name: UpsertPulledClosure :exec
+-- Root a pulled narinfo, recording the signature it was verified with. A
+-- re-fill records the latest verification. An existing upload closure for
+-- the same key is left untouched: it already keeps the object alive.
+INSERT INTO closures (key, updated_at, pulled_sig)
+VALUES ($1, timezone('UTC', now()), $2)
+ON CONFLICT (key) DO UPDATE SET updated_at = timezone('UTC', now()), pulled_sig = excluded.pulled_sig
+WHERE closures.pulled_sig IS NOT NULL;
+
+-- name: UpsertPulledNar :exec
+-- Remember what a pulled narinfo said about its NAR.
+INSERT INTO pulled_nars (key, narinfo_key, file_hash, file_size, nar_size)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (key) DO UPDATE SET
+    narinfo_key = excluded.narinfo_key,
+    file_hash = excluded.file_hash,
+    file_size = excluded.file_size,
+    nar_size = excluded.nar_size;
+
+-- name: GetPulledNar :one
+SELECT narinfo_key, file_hash, file_size, nar_size FROM pulled_nars
+WHERE key = $1;
+
+-- name: DeleteOrphanedPulledNars :execrows
+-- Drop NAR metadata whose narinfo is no longer tracked at all.
+DELETE FROM pulled_nars
+WHERE NOT EXISTS (
+    SELECT 1 FROM objects
+    WHERE objects.key = pulled_nars.narinfo_key
+);
+
+-- name: ObjectIsLive :one
+-- Whether the object is tracked and not tombstoned. The read proxy uses
+-- this instead of an S3 HEAD before redirecting NAR reads.
+SELECT EXISTS (
+    SELECT 1 FROM objects
+    WHERE key = $1 AND deleted_at IS NULL
+)::boolean AS live;
+
+-- name: ObjectIsTracked :one
+-- Whether the object has a row at all, tombstoned or not. The hit path
+-- adopts a tagged pull-through object that has none.
+SELECT EXISTS (
+    SELECT 1 FROM objects
+    WHERE key = $1
+)::boolean AS tracked;
 
 -- name: MarkObjectsAsActive :exec
 UPDATE objects SET deleted_at = NULL
