@@ -554,16 +554,50 @@ func needsDecoding(r *http.Request, info *minio.ObjectInfo) bool {
 	return strings.EqualFold(objectContentEncoding(info), "zstd") && !acceptsZstd(r)
 }
 
+// proxyContentType picks the Content-Type for a proxied object. S3's own
+// answer wins when it is specific. When the store reports nothing or a
+// generic octet-stream (some S3 implementations do not persist the type
+// set at upload, and older niks3 clients uploaded NARs, listings and
+// realisations as octet-stream) the type is derived from the key, using
+// the same types Nix's binary cache stores write. Without this a browser
+// downloads index.html instead of rendering it.
+func proxyContentType(key, reported string) string {
+	switch strings.ToLower(reported) {
+	case "", "application/octet-stream", "binary/octet-stream":
+	default:
+		return reported
+	}
+
+	switch {
+	case key == "index.html":
+		return "text/html; charset=utf-8"
+	case key == "nix-cache-info":
+		return "text/x-nix-cache-info"
+	case narinfoRe.MatchString(key):
+		return "text/x-nix-narinfo"
+	case narRe.MatchString(key):
+		return "application/x-nix-nar"
+	case lsRe.MatchString(key), realisationsRe.MatchString(key):
+		return "application/json"
+	case logRe.MatchString(key):
+		return "text/plain; charset=utf-8"
+	}
+
+	return reported
+}
+
 // setProxyHeaders sets response headers from S3 object metadata and reports
 // whether the body is decoded for the client.
 func setProxyHeaders(w http.ResponseWriter, r *http.Request, info *minio.ObjectInfo) bool {
 	decode := needsDecoding(r, info)
 
-	switch {
-	case strings.HasSuffix(info.Key, ".narinfo"):
-		w.Header().Set("Content-Type", "text/x-nix-narinfo")
-	case info.ContentType != "":
-		w.Header().Set("Content-Type", info.ContentType)
+	ct := proxyContentType(info.Key, info.ContentType)
+	if strings.HasSuffix(info.Key, ".narinfo") {
+		ct = "text/x-nix-narinfo"
+	}
+
+	if ct != "" {
+		w.Header().Set("Content-Type", ct)
 	}
 
 	if enc := objectContentEncoding(info); enc != "" {
