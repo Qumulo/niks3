@@ -11,6 +11,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,7 +32,10 @@ type fakeUpstream struct {
 	mu      sync.Mutex
 	objects map[string][]byte
 	hits    map[string]int
-	srv     *httptest.Server
+	// beforeServe, when set, runs before each object is served. Tests use
+	// it to slow a transfer or to synchronise concurrent requests.
+	beforeServe func(key string, w http.ResponseWriter) (handled bool)
+	srv         *httptest.Server
 }
 
 func newFakeUpstream(tb testing.TB) *fakeUpstream {
@@ -43,11 +48,16 @@ func newFakeUpstream(tb testing.TB) *fakeUpstream {
 		u.mu.Lock()
 		u.hits[key]++
 		data, found := u.objects[key]
+		hook := u.beforeServe
 		u.mu.Unlock()
 
 		if !found {
 			http.NotFound(w, r)
 
+			return
+		}
+
+		if hook != nil && hook(key, w) {
 			return
 		}
 
@@ -178,6 +188,51 @@ func createPullThroughTestService(tb testing.TB, upstream *fakeUpstream, trusted
 	return service
 }
 
+// withTLSS3 points the service's S3 clients at a TLS reverse proxy in front
+// of the rustfs fixture. The transport changes how minio-go uploads: over
+// plain HTTP it signs the body as aws-chunked, so a cut-short body is
+// rejected by S3 as an incomplete stream; over HTTPS, which is what
+// production speaks, it sends an unsigned payload with a plain
+// Content-Length and S3 commits the moment that many bytes have arrived.
+// The fill tests run under both, since they exist to prove a NAR that
+// fails verification never becomes an object.
+func withTLSS3(tb testing.TB, service *server.Service) {
+	tb.Helper()
+
+	target, err := url.Parse("http://" + service.MinioClient.EndpointURL().Host)
+	ok(tb, err)
+
+	// The Host header is left as the client sent it, so SigV4 verifies.
+	proxy := httptest.NewTLSServer(httputil.NewSingleHostReverseProxy(target))
+	tb.Cleanup(proxy.Close)
+
+	minioClient, err := minio.New(proxy.Listener.Addr().String(), &minio.Options{
+		Creds:     testRustfsServer.Creds(),
+		Secure:    true,
+		Transport: proxy.Client().Transport,
+	})
+	ok(tb, err)
+
+	service.MinioClient = minioClient
+	service.PresignClient = minioClient
+}
+
+// forEachS3Transport runs fn against the plain HTTP fixture and through
+// the TLS proxy; secure says which.
+func forEachS3Transport(t *testing.T, fn func(t *testing.T, secure bool)) {
+	t.Helper()
+
+	for _, tc := range []struct {
+		name   string
+		secure bool
+	}{{"http", false}, {"https", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fn(t, tc.secure)
+		})
+	}
+}
+
 // s3Object fetches an object from the test bucket; found is false on NoSuchKey.
 func s3Object(ctx context.Context, tb testing.TB, service *server.Service, key string) ([]byte, minio.ObjectInfo, bool) {
 	tb.Helper()
@@ -200,6 +255,29 @@ func s3Object(ctx context.Context, tb testing.TB, service *server.Service, key s
 	ok(tb, err)
 
 	return data, info, true
+}
+
+// waitForFill polls until key is stored in S3 and registered live in the
+// database. The client sees the last byte before the S3 upload completes.
+func waitForFill(ctx context.Context, tb testing.TB, service *server.Service, key string) []byte {
+	tb.Helper()
+
+	deadline := time.Now().Add(30 * time.Second)
+
+	for {
+		data, _, found := s3Object(ctx, tb, service, key)
+		if found {
+			if _, live, ok := getObjectRow(ctx, tb, service, key); ok && live {
+				return data
+			}
+		}
+
+		if time.Now().After(deadline) {
+			tb.Fatalf("%s: fill did not complete (s3=%v)", key, found)
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 func zstdDecompress(tb testing.TB, data []byte) []byte {
@@ -232,6 +310,22 @@ func getObjectRow(ctx context.Context, tb testing.TB, service *server.Service, k
 	ok(tb, err)
 
 	return refs, live, true
+}
+
+// waitForNoFill gives a fill that must not happen time to happen, then
+// asserts key is neither in S3 nor registered.
+func waitForNoFill(ctx context.Context, tb testing.TB, service *server.Service, key string) {
+	tb.Helper()
+
+	time.Sleep(200 * time.Millisecond)
+
+	if _, _, found := s3Object(ctx, tb, service, key); found {
+		tb.Errorf("%s was stored", key)
+	}
+
+	if _, _, found := getObjectRow(ctx, tb, service, key); found {
+		tb.Errorf("%s was registered", key)
+	}
 }
 
 func TestPullThroughNarinfoMissThenHit(t *testing.T) {
@@ -304,6 +398,65 @@ func TestPullThroughNarinfoMissThenHit(t *testing.T) {
 	}
 
 	if n := upstream.hitCount(fx.narinfoKey); n != 1 {
+		t.Errorf("upstream hits = %d, want 1", n)
+	}
+}
+
+func TestPullThroughNarMissThenHit(t *testing.T) {
+	t.Parallel()
+	forEachS3Transport(t, testPullThroughNarMissThenHit)
+}
+
+func testPullThroughNarMissThenHit(t *testing.T, secure bool) {
+	t.Helper()
+
+	ctx := t.Context()
+	upstream := newFakeUpstream(t)
+	// Larger than one minio part so the multipart path is exercised.
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 20<<20))
+	fx.publish(upstream)
+
+	service := createPullThroughTestService(t, upstream, fx.publicKey)
+	defer service.Close()
+
+	if secure {
+		withTLSS3(t, service)
+	}
+
+	ts := setupProxyServer(t, service)
+	defer ts.Close()
+
+	// The narinfo first, as Nix does, so the NAR's FileHash is known.
+	proxyGet(t, ts, "/"+fx.narinfoKey, http.StatusOK)
+
+	header, body := proxyGet(t, ts, "/"+fx.narKey, http.StatusOK)
+	if !bytes.Equal(body, fx.nar) {
+		t.Fatal("NAR body differs from upstream")
+	}
+
+	if got := header.Get("X-Cache-Status"); got != "MISS" {
+		t.Errorf("X-Cache-Status = %q, want MISS", got)
+	}
+
+	if got := header.Get("Content-Length"); got != strconv.Itoa(len(fx.nar)) {
+		t.Errorf("Content-Length = %q", got)
+	}
+
+	if stored := waitForFill(ctx, t, service, fx.narKey); !bytes.Equal(stored, fx.nar) {
+		t.Fatal("NAR not stored intact")
+	}
+
+	// A NAR is not a root of its own; only the narinfo is.
+	if _, found := getClosureRow(ctx, t, service, fx.narKey); found {
+		t.Error("NAR must not get a closure row")
+	}
+
+	header, body = proxyGet(t, ts, "/"+fx.narKey, http.StatusOK)
+	if !bytes.Equal(body, fx.nar) || header.Get("X-Cache-Status") != "HIT" {
+		t.Errorf("second read: status=%q", header.Get("X-Cache-Status"))
+	}
+
+	if n := upstream.hitCount(fx.narKey); n != 1 {
 		t.Errorf("upstream hits = %d, want 1", n)
 	}
 }
@@ -530,6 +683,319 @@ func TestPullThroughRejectsMismatchedStorePath(t *testing.T) {
 	defer ts.Close()
 
 	proxyGet(t, ts, "/4hcdxyjf9yiq7qf3i4548drb6sjmwa1v.narinfo", http.StatusBadGateway)
+}
+
+func TestPullThroughNarFileHashMismatchNotStored(t *testing.T) {
+	t.Parallel()
+	forEachS3Transport(t, testPullThroughNarFileHashMismatchNotStored)
+}
+
+func testPullThroughNarFileHashMismatchNotStored(t *testing.T, secure bool) {
+	t.Helper()
+
+	ctx := t.Context()
+	upstream := newFakeUpstream(t)
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 4096))
+	upstream.put(fx.narinfoKey, fx.narinfo)
+	// Same size, different bytes: only the hash check can catch this.
+	upstream.put(fx.narKey, randomNar(t, len(fx.nar)))
+
+	service := createPullThroughTestService(t, upstream, fx.publicKey)
+	defer service.Close()
+
+	if secure {
+		withTLSS3(t, service)
+	}
+
+	ts := setupProxyServer(t, service)
+	defer ts.Close()
+
+	proxyGet(t, ts, "/"+fx.narinfoKey, http.StatusOK)
+	// The client still receives the bytes (the status is already sent),
+	// and Nix will reject them by NarHash. We must not keep them.
+	proxyGet(t, ts, "/"+fx.narKey, http.StatusOK)
+
+	time.Sleep(200 * time.Millisecond)
+
+	if _, _, found := s3Object(ctx, t, service, fx.narKey); found {
+		t.Error("NAR with wrong FileHash was stored")
+	}
+
+	if _, _, found := getObjectRow(ctx, t, service, fx.narKey); found {
+		t.Error("NAR with wrong FileHash was registered")
+	}
+}
+
+func TestPullThroughNarWithoutNarinfoNotStored(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	upstream := newFakeUpstream(t)
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 4096))
+	fx.publish(upstream)
+
+	service := createPullThroughTestService(t, upstream, fx.publicKey)
+	defer service.Close()
+
+	ts := setupProxyServer(t, service)
+	defer ts.Close()
+
+	// Nothing vouches for this NAR yet: it is served but not kept.
+	header, body := proxyGet(t, ts, "/"+fx.narKey, http.StatusOK)
+	if !bytes.Equal(body, fx.nar) || header.Get("X-Cache-Status") != "MISS" {
+		t.Fatalf("unverified read: status=%q len=%d", header.Get("X-Cache-Status"), len(body))
+	}
+
+	waitForNoFill(ctx, t, service, fx.narKey)
+
+	// Once the narinfo has been seen the next miss is verified and kept.
+	proxyGet(t, ts, "/"+fx.narinfoKey, http.StatusOK)
+	proxyGet(t, ts, "/"+fx.narKey, http.StatusOK)
+
+	if stored := waitForFill(ctx, t, service, fx.narKey); !bytes.Equal(stored, fx.nar) {
+		t.Fatal("NAR not stored intact")
+	}
+
+	if n := upstream.hitCount(fx.narKey); n != 2 {
+		t.Errorf("upstream hits = %d, want 2", n)
+	}
+}
+
+func TestPullThroughNarVerifiedFromDatabase(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	upstream := newFakeUpstream(t)
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 4096))
+	upstream.put(fx.narinfoKey, fx.narinfo)
+	upstream.put(fx.narKey, randomNar(t, len(fx.nar)))
+
+	service := createPullThroughTestService(t, upstream, fx.publicKey)
+	defer service.Close()
+
+	ts := setupProxyServer(t, service)
+	defer ts.Close()
+
+	proxyGet(t, ts, "/"+fx.narinfoKey, http.StatusOK)
+
+	// A restart (or another replica) has no in-memory metadata; the
+	// database still knows what the narinfo said.
+	fresh, err := server.NewPullThrough(server.PullThroughConfig{
+		Upstreams:   []string{upstream.srv.URL},
+		TrustedKeys: []string{fx.publicKey},
+	})
+	ok(t, err)
+
+	service.PullThrough = fresh
+
+	proxyGet(t, ts, "/"+fx.narKey, http.StatusOK)
+	waitForNoFill(ctx, t, service, fx.narKey)
+
+	// With the right bytes upstream the same restart-fresh server fills.
+	upstream.put(fx.narKey, fx.nar)
+	proxyGet(t, ts, "/"+fx.narKey, http.StatusOK)
+
+	if stored := waitForFill(ctx, t, service, fx.narKey); !bytes.Equal(stored, fx.nar) {
+		t.Fatal("NAR not stored intact")
+	}
+}
+
+func TestPullThroughNarLongerThanFileSizeNotStored(t *testing.T) {
+	t.Parallel()
+	forEachS3Transport(t, testPullThroughNarLongerThanFileSizeNotStored)
+}
+
+func testPullThroughNarLongerThanFileSizeNotStored(t *testing.T, secure bool) {
+	t.Helper()
+
+	ctx := t.Context()
+	upstream := newFakeUpstream(t)
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 4096))
+	fx.publish(upstream)
+
+	// A chunked upstream (no Content-Length) that keeps sending past the
+	// FileSize the narinfo announced. minio stops reading at that size and
+	// completes the upload; the fill must notice, not hang on the dead
+	// pipe, and take the object back out. The pause makes the NAR and the
+	// surplus arrive as separate reads, so the fill has released the
+	// whole announced size to S3 before it learns the body runs long.
+	upstream.beforeServe = func(key string, w http.ResponseWriter) bool {
+		if key != fx.narKey {
+			return false
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(fx.nar)
+		_ = http.NewResponseController(w).Flush()
+
+		time.Sleep(100 * time.Millisecond)
+
+		_, _ = w.Write([]byte("trailing garbage"))
+
+		return true
+	}
+
+	service := createPullThroughTestService(t, upstream, fx.publicKey)
+	defer service.Close()
+
+	if secure {
+		withTLSS3(t, service)
+	}
+
+	ts := setupProxyServer(t, service)
+	defer ts.Close()
+
+	proxyGet(t, ts, "/"+fx.narinfoKey, http.StatusOK)
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		// The announced Content-Length is the FileSize, so the client sees
+		// exactly the NAR.
+		_, body := proxyGet(t, ts, "/"+fx.narKey, http.StatusOK)
+		if !bytes.Equal(body, fx.nar) {
+			t.Error("client did not receive the NAR")
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("NAR request hung")
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+
+	for {
+		_, _, inS3 := s3Object(ctx, t, service, fx.narKey)
+		_, _, inDB := getObjectRow(ctx, t, service, fx.narKey)
+
+		if !inS3 && !inDB {
+			break
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("over-long NAR kept (s3=%v db=%v)", inS3, inDB)
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestPullThroughConcurrentFillsOnce(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	upstream := newFakeUpstream(t)
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 1<<20))
+	fx.publish(upstream)
+
+	// Hold both NAR requests until they have both arrived, so both are in
+	// flight at once.
+	var arrived sync.WaitGroup
+
+	arrived.Add(2)
+
+	upstream.beforeServe = func(key string, _ http.ResponseWriter) bool {
+		if key == fx.narKey {
+			arrived.Done()
+			arrived.Wait()
+		}
+
+		return false
+	}
+
+	service := createPullThroughTestService(t, upstream, fx.publicKey)
+	defer service.Close()
+
+	ts := setupProxyServer(t, service)
+	defer ts.Close()
+
+	proxyGet(t, ts, "/"+fx.narinfoKey, http.StatusOK)
+
+	var wg sync.WaitGroup
+
+	for range 2 {
+		wg.Go(func() {
+			_, body := proxyGet(t, ts, "/"+fx.narKey, http.StatusOK)
+			if !bytes.Equal(body, fx.nar) {
+				t.Error("concurrent reader got a wrong body")
+			}
+		})
+	}
+
+	wg.Wait()
+
+	if stored := waitForFill(ctx, t, service, fx.narKey); !bytes.Equal(stored, fx.nar) {
+		t.Fatal("NAR not stored intact")
+	}
+
+	if n := upstream.hitCount(fx.narKey); n != 2 {
+		t.Errorf("upstream hits = %d, want 2 (one fill, one passthrough)", n)
+	}
+}
+
+func TestPullThroughFillSurvivesClientDisconnect(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	upstream := newFakeUpstream(t)
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 4<<20))
+	fx.publish(upstream)
+
+	// Trickle the NAR so the client can go away mid-transfer.
+	upstream.beforeServe = func(key string, w http.ResponseWriter) bool {
+		if key != fx.narKey {
+			return false
+		}
+
+		w.Header().Set("Content-Length", strconv.Itoa(len(fx.nar)))
+		w.WriteHeader(http.StatusOK)
+
+		flusher, _ := w.(http.Flusher)
+
+		for off := 0; off < len(fx.nar); off += 64 << 10 {
+			end := min(off+64<<10, len(fx.nar))
+			_, _ = w.Write(fx.nar[off:end])
+
+			if flusher != nil {
+				flusher.Flush()
+			}
+
+			time.Sleep(2 * time.Millisecond)
+		}
+
+		return true
+	}
+
+	service := createPullThroughTestService(t, upstream, fx.publicKey)
+	defer service.Close()
+
+	ts := setupProxyServer(t, service)
+	defer ts.Close()
+
+	proxyGet(t, ts, "/"+fx.narinfoKey, http.StatusOK)
+
+	reqCtx, cancel := context.WithCancel(ctx)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, ts.URL+"/"+fx.narKey, nil)
+	ok(t, err)
+
+	resp, err := http.DefaultClient.Do(req)
+	ok(t, err)
+
+	// Read a little, then hang up.
+	_, err = io.ReadFull(resp.Body, make([]byte, 100<<10))
+	ok(t, err)
+
+	cancel()
+
+	_ = resp.Body.Close()
+
+	if stored := waitForFill(ctx, t, service, fx.narKey); !bytes.Equal(stored, fx.nar) {
+		t.Fatal("stored NAR is not intact")
+	}
 }
 
 func TestNewPullThroughValidation(t *testing.T) {
