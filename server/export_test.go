@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Mic92/niks3/api"
+	"github.com/Mic92/niks3/server/signing"
 )
 
 // SystemdListenerForTest exposes systemdListener to tests.
@@ -80,6 +81,18 @@ func RestartedNow(grace time.Duration) {
 	startedAt = time.Now()
 	incumbentGrace = grace
 }
+
+// Test-only re-exports for the narinfo parser used by pull-through.
+
+type Narinfo = narinfo
+
+func ParseNarinfo(data []byte) (*Narinfo, error) { return parseNarinfo(data) }
+
+func (n *Narinfo) RefKeys() []string { return n.refKeys() }
+
+func (n *Narinfo) SigningInfo() *signing.NarInfo { return n.signingInfo() }
+
+func HashMatches(nixHash string, digest []byte) bool { return hashMatches(nixHash, digest) }
 
 // ProxyContentType is an export of proxyContentType for tests.
 func ProxyContentType(key, reported string) string { return proxyContentType(key, reported) }
