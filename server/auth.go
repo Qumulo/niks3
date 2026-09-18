@@ -11,7 +11,11 @@ import (
 	"github.com/Mic92/niks3/server/oidc"
 )
 
-var allScopes = []oidc.Scope{oidc.ScopeRead, oidc.ScopeWrite, oidc.ScopeAdmin}
+// allScopes is what a fully trusted caller is granted: a fresh slice each
+// time, so no caller shares one.
+func allScopes() []oidc.Scope {
+	return []oidc.Scope{oidc.ScopeRead, oidc.ScopeWrite, oidc.ScopeAdmin}
+}
 
 // readGated reports whether the read proxy requires authentication. Reads are
 // public unless the operator configured a read rule somewhere, since Nix
@@ -22,9 +26,9 @@ func (s *Service) readGated() bool {
 
 // requestScopes authenticates r and returns the granted scopes. ok is false
 // when no valid credentials were presented at all.
-func (s *Service) requestScopes(r *http.Request) (scopes []oidc.Scope, ok bool) {
+func (s *Service) requestScopes(r *http.Request) ([]oidc.Scope, bool) {
 	if s.mtlsCheck(r, s.MTLSBoundSubjects) {
-		return allScopes, true
+		return allScopes(), true
 	}
 
 	if len(s.MTLSBoundSubjectsRead) > 0 && s.mtlsCheck(r, s.MTLSBoundSubjectsRead) {
@@ -37,7 +41,7 @@ func (s *Service) requestScopes(r *http.Request) (scopes []oidc.Scope, ok bool) 
 	}
 
 	if s.APIToken != "" && subtle.ConstantTimeCompare([]byte(token), []byte(s.APIToken)) == 1 {
-		return allScopes, true
+		return allScopes(), true
 	}
 
 	if s.OIDCValidator == nil {
@@ -59,7 +63,7 @@ func (s *Service) requestScopes(r *http.Request) (scopes []oidc.Scope, ok bool) 
 	slog.Info("OIDC auth successful", "provider", claims.Provider, "scopes", claims.Scopes)
 	slog.Debug("OIDC auth details", "subject", claims.Subject)
 
-	scopes = claims.Scopes
+	scopes := claims.Scopes
 	// Anyone who may upload or administer may also read.
 	if !claims.Has(oidc.ScopeRead) {
 		scopes = append(slices.Clone(scopes), oidc.ScopeRead)
