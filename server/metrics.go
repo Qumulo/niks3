@@ -43,6 +43,10 @@ type Metrics struct {
 	skippedNarBytes   prometheus.Counter
 	commitDuration    prometheus.Histogram
 	commitObjects     prometheus.Counter
+
+	pullThroughRequests      *prometheus.CounterVec
+	pullThroughUpstreamBytes prometheus.Counter
+	pullThroughInFlight      prometheus.Gauge
 }
 
 // NewMetrics builds a registry with the Go/process collectors and the cache
@@ -126,6 +130,18 @@ func NewMetrics() *Metrics {
 			Name: "niks3_commit_objects_total",
 			Help: "Pending objects folded into the cache by committed pushes.",
 		}),
+		pullThroughRequests: factory.NewCounterVec(prometheus.CounterOpts{
+			Name: "niks3_pull_through_requests_total",
+			Help: "Read proxy requests for narinfos and NARs by outcome (hit, miss, negative, rejected, upstream_error).",
+		}, []string{"kind", "result"}),
+		pullThroughUpstreamBytes: factory.NewCounter(prometheus.CounterOpts{
+			Name: "niks3_pull_through_upstream_bytes_total",
+			Help: "Bytes fetched from upstream caches by the pull-through read proxy.",
+		}),
+		pullThroughInFlight: factory.NewGauge(prometheus.GaugeOpts{
+			Name: "niks3_pull_through_in_flight",
+			Help: "Upstream fetches currently in progress.",
+		}),
 	}
 }
 
@@ -197,6 +213,31 @@ func methodLabel(method string) string {
 // Handler serves the metrics in the Prometheus text format.
 func (m *Metrics) Handler() http.Handler {
 	return promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{})
+}
+
+// recordPullThrough counts one read proxy request for a pull-through kind.
+func (m *Metrics) recordPullThrough(kind, result string) {
+	if m == nil {
+		return
+	}
+
+	m.pullThroughRequests.WithLabelValues(kind, result).Inc()
+}
+
+func (m *Metrics) addPullThroughBytes(n int64) {
+	if m == nil {
+		return
+	}
+
+	m.pullThroughUpstreamBytes.Add(float64(n))
+}
+
+func (m *Metrics) pullThroughInFlightAdd(delta float64) {
+	if m == nil {
+		return
+	}
+
+	m.pullThroughInFlight.Add(delta)
 }
 
 // recordGC records the outcome of a garbage collection run.
