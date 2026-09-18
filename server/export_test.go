@@ -80,3 +80,6 @@ func RestartedNow(grace time.Duration) {
 	startedAt = time.Now()
 	incumbentGrace = grace
 }
+
+// ProxyContentType is an export of proxyContentType for tests.
+func ProxyContentType(key, reported string) string { return proxyContentType(key, reported) }
