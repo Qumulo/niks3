@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Mic92/niks3/api"
+	"github.com/Mic92/niks3/server/signing"
 )
 
 // SystemdListenerForTest exposes systemdListener to tests.
@@ -121,6 +122,18 @@ func AbortSucceeded(err error) bool {
 func (s *Service) EnsureAbortUploadsRule(ctx context.Context) {
 	s.ensureAbortUploadsRule(ctx)
 }
+
+// Test-only re-exports for the narinfo parser used by pull-through.
+
+type Narinfo = narinfo
+
+func ParseNarinfo(data []byte) (*Narinfo, error) { return parseNarinfo(data) }
+
+func (n *Narinfo) RefKeys() []string { return n.refKeys() }
+
+func (n *Narinfo) SigningInfo() *signing.NarInfo { return n.signingInfo() }
+
+func HashMatches(nixHash string, digest []byte) bool { return hashMatches(nixHash, digest) }
 
 // RequestWho is an export of requestWho for tests.
 func RequestWho(r *http.Request) string { return requestWho(r) }
