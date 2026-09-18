@@ -1555,6 +1555,184 @@ func TestPullThroughGCExpiresUntrustedKeys(t *testing.T) {
 	}
 }
 
+// waitUntil polls cond for up to ten seconds.
+func waitUntil(tb testing.TB, what string, cond func() bool) {
+	tb.Helper()
+
+	deadline := time.Now().Add(10 * time.Second)
+
+	for !cond() {
+		if time.Now().After(deadline) {
+			tb.Fatalf("timed out waiting for %s", what)
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// forgetPulled drops every row a narinfo fill wrote, which is what a
+// registration that failed after the S3 write leaves behind.
+func forgetPulled(ctx context.Context, tb testing.TB, service *server.Service, narinfoKey string) {
+	tb.Helper()
+
+	for _, q := range []string{
+		"DELETE FROM closures WHERE key = $1",
+		"DELETE FROM pulled_nars WHERE narinfo_key = $1",
+		"DELETE FROM objects WHERE key = $1",
+	} {
+		_, err := service.Pool.Exec(ctx, q, narinfoKey)
+		ok(tb, err)
+	}
+}
+
+// A fill tags what it writes; a hit on a tagged object the database does
+// not know registers it again, re-verified against the trusted keys.
+func TestPullThroughAdoptsUntrackedNarinfo(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	upstream := newFakeUpstream(t)
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 64))
+	fx.publish(upstream)
+
+	service := createPullThroughTestService(t, upstream, fx.publicKey)
+	defer service.Close()
+
+	ts := setupProxyServer(t, service)
+	defer ts.Close()
+
+	proxyGet(t, ts, "/"+fx.narinfoKey, http.StatusOK)
+
+	_, info, found := s3Object(ctx, t, service, fx.narinfoKey)
+	if !found {
+		t.Fatal("narinfo was not stored")
+	}
+
+	if tag := info.Metadata.Get("X-Amz-Meta-Niks3-Pulled"); tag != fx.sig {
+		t.Fatalf("narinfo tag = %q, want the verified signature %q", tag, fx.sig)
+	}
+
+	forgetPulled(ctx, t, service, fx.narinfoKey)
+	service.PullThrough.ForgetChecks()
+
+	header, _ := proxyGet(t, ts, "/"+fx.narinfoKey, http.StatusOK)
+	if header.Get("X-Cache-Status") != "HIT" {
+		t.Fatalf("X-Cache-Status = %q, want HIT", header.Get("X-Cache-Status"))
+	}
+
+	waitUntil(t, "narinfo adoption", func() bool {
+		row, found := getClosureRow(ctx, t, service, fx.narinfoKey)
+
+		return found && row.pulledSig.String == fx.sig
+	})
+
+	if refs, live, found := getObjectRow(ctx, t, service, fx.narinfoKey); !found || !live || len(refs) != 2 {
+		t.Errorf("object row refs=%v live=%v found=%v after adoption", refs, live, found)
+	}
+
+	if !hasPulledNarRow(ctx, t, service, fx.narKey) {
+		t.Error("NAR metadata was not restored by the adoption")
+	}
+
+	if n := upstream.hitCount(fx.narinfoKey); n != 1 {
+		t.Errorf("upstream hits = %d, want 1: adoption must not refetch", n)
+	}
+
+	// With the metadata back, the NAR can be verified and stored.
+	proxyGet(t, ts, "/"+fx.narKey, http.StatusOK)
+	waitForFill(ctx, t, service, fx.narKey)
+}
+
+func TestPullThroughAdoptsUntrackedNar(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	upstream := newFakeUpstream(t)
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 64))
+	fx.publish(upstream)
+
+	service := createPullThroughTestService(t, upstream, fx.publicKey)
+	defer service.Close()
+
+	ts := setupProxyServer(t, service)
+	defer ts.Close()
+
+	proxyGet(t, ts, "/"+fx.narinfoKey, http.StatusOK)
+	proxyGet(t, ts, "/"+fx.narKey, http.StatusOK)
+	waitForFill(ctx, t, service, fx.narKey)
+
+	_, info, _ := s3Object(ctx, t, service, fx.narKey)
+	if tag := info.Metadata.Get("X-Amz-Meta-Niks3-Pulled"); tag != fx.narinfoKey {
+		t.Fatalf("NAR tag = %q, want its narinfo key %q", tag, fx.narinfoKey)
+	}
+
+	_, err := service.Pool.Exec(ctx, "DELETE FROM objects WHERE key = $1", fx.narKey)
+	ok(t, err)
+
+	service.PullThrough.ForgetChecks()
+
+	header, _ := proxyGet(t, ts, "/"+fx.narKey, http.StatusOK)
+	if header.Get("X-Cache-Status") != "HIT" {
+		t.Fatalf("X-Cache-Status = %q, want HIT", header.Get("X-Cache-Status"))
+	}
+
+	waitUntil(t, "NAR adoption", func() bool {
+		_, live, found := getObjectRow(ctx, t, service, fx.narKey)
+
+		return found && live
+	})
+
+	if n := upstream.hitCount(fx.narKey); n != 1 {
+		t.Errorf("upstream hits = %d, want 1", n)
+	}
+}
+
+// Adoption is for objects a fill wrote and nothing else: an object another
+// tool put in the bucket carries no tag and stays untracked, and a
+// tombstoned row is not resurrected from a hit.
+func TestPullThroughAdoptionLeavesForeignAndTombstonedAlone(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	upstream := newFakeUpstream(t)
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 64))
+	foreign := newFixture(t, "4hcdxyjf9yiq7qf3i4548drb6sjmwa1v", randomNar(t, 64))
+
+	fx.publish(upstream)
+
+	service := createPullThroughTestService(t, upstream, fx.publicKey)
+	defer service.Close()
+
+	ts := setupProxyServer(t, service)
+	defer ts.Close()
+
+	putTestObject(ctx, t, service, foreign.narinfoKey, zstdCompress(t, foreign.narinfo),
+		minio.PutObjectOptions{ContentType: "text/x-nix-narinfo", ContentEncoding: "zstd"})
+
+	proxyGet(t, ts, "/"+fx.narinfoKey, http.StatusOK)
+
+	_, err := service.Pool.Exec(ctx, "UPDATE objects SET deleted_at = now(), first_deleted_at = now() WHERE key = $1", fx.narinfoKey)
+	ok(t, err)
+
+	service.PullThrough.ForgetChecks()
+
+	for _, key := range []string{foreign.narinfoKey, fx.narinfoKey} {
+		if header, _ := proxyGet(t, ts, "/"+key, http.StatusOK); header.Get("X-Cache-Status") != "HIT" {
+			t.Fatalf("%s: X-Cache-Status = %q, want HIT", key, header.Get("X-Cache-Status"))
+		}
+	}
+
+	service.PullThrough.WaitChecks()
+
+	if _, _, found := getObjectRow(ctx, t, service, foreign.narinfoKey); found {
+		t.Error("untagged object was adopted")
+	}
+
+	if _, live, found := getObjectRow(ctx, t, service, fx.narinfoKey); !found || live {
+		t.Errorf("tombstoned row found=%v live=%v, want still tombstoned", found, live)
+	}
+}
+
 // The server's own signing keys are always trusted, so a pull-through
 // with no --trusted-key still verifies against something.
 func TestTrustedKeysWithSigning(t *testing.T) {
