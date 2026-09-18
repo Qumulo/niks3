@@ -240,6 +240,30 @@ SELECT pending_closure_id, object_key, upload_id
 FROM multipart_uploads
 WHERE upload_id = $1 AND object_key = $2;
 
+-- name: ResurrectReachableObjects :execrows
+-- Clear the tombstone of objects that became reachable again after they
+-- were marked: a pull-through fill re-rooted a narinfo whose NAR was still
+-- tombstoned, or an upload re-offered them. Runs under the GC lock before
+-- the tombstones are read for S3 deletion, so no delete can be in flight
+-- for these keys and their S3 objects are known to exist.
+WITH RECURSIVE closure_reach AS (
+    SELECT o.key, o.refs
+    FROM objects o
+    INNER JOIN closures c ON o.key = c.key
+    UNION
+    SELECT o.key, o.refs
+    FROM objects o
+    INNER JOIN closure_reach cr ON o.key = ANY(cr.refs)
+)
+
+UPDATE objects
+SET deleted_at = NULL, first_deleted_at = NULL
+WHERE objects.deleted_at IS NOT NULL
+  AND EXISTS (
+      SELECT 1 FROM closure_reach cr
+      WHERE cr.key = objects.key
+  );
+
 -- name: MarkStaleObjects :execrows
 WITH RECURSIVE ct AS (
     SELECT timezone('UTC', now()) AS now
