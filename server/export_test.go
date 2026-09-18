@@ -90,3 +90,6 @@ func ServeProxySocketForTest(shutdownCtx context.Context, handler http.Handler, 
 		{server: &http.Server{Handler: handler, ReadHeaderTimeout: time.Second}, ln: unix},
 	}, nil)
 }
+
+// ProxyContentType is an export of proxyContentType for tests.
+func ProxyContentType(key, reported string) string { return proxyContentType(key, reported) }
