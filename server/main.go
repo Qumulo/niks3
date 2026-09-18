@@ -174,8 +174,8 @@ func validatePullThrough(opts *options) error {
 		return errors.New("--pull-through-negative-ttl must not be negative")
 	}
 
-	if opts.PullThrough.NarinfoConcurrency < 0 {
-		return errors.New("--pull-through-narinfo-concurrency must not be negative")
+	if opts.PullThrough.Concurrency < 0 || opts.PullThrough.NarinfoConcurrency < 0 {
+		return errors.New("--pull-through-concurrency and --pull-through-narinfo-concurrency must not be negative")
 	}
 
 	if len(opts.PullThrough.Upstreams) > 0 && len(opts.TrustedKeys) == 0 && len(opts.SignKeyPaths) == 0 {
@@ -208,6 +208,9 @@ func pullThroughFlags(opts *options) {
 	flag.DurationVar(&opts.PullThrough.NegativeTTL, "pull-through-negative-ttl",
 		getEnvOrDefaultDuration("NIKS3_PULL_THROUGH_NEGATIVE_TTL", time.Minute),
 		"How long an upstream 404 is remembered before asking again")
+	flag.IntVar(&opts.PullThrough.Concurrency, "pull-through-concurrency",
+		getEnvOrDefaultInt("NIKS3_PULL_THROUGH_CONCURRENCY", pullThroughDefaultConcurrency),
+		"Maximum concurrent NAR fills from upstream. Each may hold a 16 MiB multipart part in memory")
 	flag.IntVar(&opts.PullThrough.NarinfoConcurrency, "pull-through-narinfo-concurrency",
 		getEnvOrDefaultInt("NIKS3_PULL_THROUGH_NARINFO_CONCURRENCY", pullThroughDefaultNarinfoConcurrency),
 		"Maximum concurrent narinfo fills from upstream")
