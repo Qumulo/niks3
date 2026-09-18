@@ -83,3 +83,6 @@ func CloneServiceForTest(ctx context.Context, s *Service) *Service {
 
 	return &c
 }
+
+// ProxyContentType is an export of proxyContentType for tests.
+func ProxyContentType(key, reported string) string { return proxyContentType(key, reported) }
