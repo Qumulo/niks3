@@ -10,6 +10,10 @@ type GCStats struct {
 	// OldClosuresDeleted is the number of closures older than the threshold that were deleted
 	OldClosuresDeleted int `json:"old_closures_deleted"`
 
+	// PulledClosuresUntrusted is the number of pull-through closures expired because
+	// no currently trusted key verified their narinfo
+	PulledClosuresUntrusted int `json:"pulled_closures_untrusted"`
+
 	// ObjectsMarkedForDeletion is the number of unreachable objects marked as deleted
 	ObjectsMarkedForDeletion int `json:"objects_marked_for_deletion"`
 
