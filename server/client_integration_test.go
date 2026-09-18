@@ -109,9 +109,11 @@ func verifyNarinfoInS3(ctx context.Context, t *testing.T, testService *server.Se
 	// Extract URL from narinfo and verify NAR file exists
 	narURL := getNARURLFromNarinfo(ctx, t, testService, narinfoKey)
 
-	_, err = testService.MinioClient.StatObject(ctx, testService.Bucket, narURL, minio.StatObjectOptions{})
+	narInfo, err := testService.MinioClient.StatObject(ctx, testService.Bucket, narURL, minio.StatObjectOptions{})
 	if err != nil {
 		t.Errorf("NAR file not found in S3 at %s: %v", narURL, err)
+	} else if narInfo.ContentType != "application/x-nix-nar" {
+		t.Errorf("NAR Content-Type = %q, want the type Nix's binary cache stores use", narInfo.ContentType)
 	}
 }
 
@@ -132,6 +134,13 @@ func verifyLsFileInS3(ctx context.Context, t *testing.T, testService *server.Ser
 	compressedLsContent, err := io.ReadAll(lsObj)
 	ok(t, err)
 	t.Logf("Retrieved .ls file from S3 (compressed size: %d bytes)", len(compressedLsContent))
+
+	lsInfo, err := lsObj.Stat()
+	ok(t, err)
+
+	if lsInfo.ContentType != "application/json" {
+		t.Errorf(".ls Content-Type = %q, want application/json", lsInfo.ContentType)
+	}
 
 	zstdReader, err := zstd.NewReader(bytes.NewReader(compressedLsContent))
 	ok(t, err)
@@ -257,6 +266,13 @@ func TestClientIntegration(t *testing.T) {
 	// Initialize the bucket with nix-cache-info
 	err := testService.InitializeBucket(t.Context())
 	ok(t, err)
+
+	cacheInfo, err := testService.MinioClient.StatObject(t.Context(), testService.Bucket, "nix-cache-info", minio.StatObjectOptions{})
+	ok(t, err)
+
+	if cacheInfo.ContentType != "text/x-nix-cache-info" {
+		t.Errorf("nix-cache-info Content-Type = %q, want text/x-nix-cache-info", cacheInfo.ContentType)
+	}
 
 	mux := http.NewServeMux()
 	registerTestHandlers(mux, testService)
