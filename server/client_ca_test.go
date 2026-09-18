@@ -74,6 +74,12 @@ func verifyRealisationFiles(ctx context.Context, t *testing.T, testService *serv
 		realisationObj, err := testService.MinioClient.GetObject(ctx, testService.Bucket, realisationKey, minio.GetObjectOptions{})
 		ok(t, err)
 
+		if info, statErr := realisationObj.Stat(); statErr != nil {
+			t.Errorf("stat %s: %v", realisationKey, statErr)
+		} else if info.ContentType != "application/json" {
+			t.Errorf("%s Content-Type = %q, want application/json", realisationKey, info.ContentType)
+		}
+
 		compressedRealisation, err := io.ReadAll(realisationObj)
 		if closeErr := realisationObj.Close(); closeErr != nil {
 			t.Logf("Failed to close realisation object: %v", closeErr)
