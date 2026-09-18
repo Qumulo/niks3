@@ -1,4 +1,4 @@
-name: Build and push image to qcr
+name: Build and push image and chart to qcr
 on:
   push:
     branches:
@@ -17,6 +17,7 @@ jobs:
     env:
       REGISTRY: qcr.corp.qumulo.com
       IMAGE: qcr.corp.qumulo.com/engineering/niks3
+      CHARTS: oci://qcr.corp.qumulo.com/engineering/charts
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -61,3 +62,20 @@ jobs:
           regctl registry login "$REGISTRY" -u "$QCR_USERNAME" --pass-stdin <<< "$QCR_SECRET"
           regctl image import "ocidir://local:niks3" ./result
           regctl image copy "ocidir://local:niks3" "$IMAGE:${GITHUB_REF_NAME}"
+      - name: Push Helm chart
+        # Only for dated tags: the chart version must be SemVer, so
+        # 2026.09.04 becomes 2026.9.4 (leading zeros are not allowed) and
+        # the tag itself is kept as appVersion. The image tag in production
+        # is pinned separately, so a chart version need not match an image.
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          QCR_USERNAME: ${{ secrets.QCR_USERNAME }}
+          QCR_SECRET: ${{ secrets.QCR_SECRET }}
+        run: |
+          set -xe
+          PATH="$(nix build --inputs-from . nixpkgs#kubernetes-helm --print-out-paths --no-link)/bin:$PATH"
+          IFS=. read -r y m d <<< "${GITHUB_REF_NAME}"
+          VERSION="$((10#$y)).$((10#$m)).$((10#$d))"
+          helm registry login "$REGISTRY" -u "$QCR_USERNAME" --password-stdin <<< "$QCR_SECRET"
+          helm package deploy/helm/niks3 --version "$VERSION" --app-version "${GITHUB_REF_NAME}" -d dist
+          helm push "dist/niks3-${VERSION}.tgz" "$CHARTS"
