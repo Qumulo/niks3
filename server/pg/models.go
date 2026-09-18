@@ -17,6 +17,7 @@ type Claim struct {
 type Closure struct {
 	Key       string           `json:"key"`
 	UpdatedAt pgtype.Timestamp `json:"updated_at"`
+	PulledSig pgtype.Text      `json:"pulled_sig"`
 }
 
 type MultipartUpload struct {
@@ -58,4 +59,12 @@ type Pin struct {
 	StorePath  string             `json:"store_path"`
 	CreatedAt  pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
+}
+
+type PulledNar struct {
+	Key        string `json:"key"`
+	NarinfoKey string `json:"narinfo_key"`
+	FileHash   string `json:"file_hash"`
+	FileSize   int64  `json:"file_size"`
+	NarSize    int64  `json:"nar_size"`
 }
