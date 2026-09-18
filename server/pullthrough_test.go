@@ -61,6 +61,12 @@ func newFakeUpstream(tb testing.TB) *fakeUpstream {
 			return
 		}
 
+		if r.Header.Get("Range") != "" {
+			http.ServeContent(w, r, key, time.Time{}, bytes.NewReader(data))
+
+			return
+		}
+
 		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 		w.WriteHeader(http.StatusOK)
 
@@ -458,6 +464,57 @@ func testPullThroughNarMissThenHit(t *testing.T, secure bool) {
 
 	if n := upstream.hitCount(fx.narKey); n != 1 {
 		t.Errorf("upstream hits = %d, want 1", n)
+	}
+}
+
+// A Range on a miss is what Nix sends to resume a download that dropped
+// mid-transfer. It is answered from upstream and never fills.
+func TestPullThroughRangeOnMissPassesThrough(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	upstream := newFakeUpstream(t)
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 8192))
+	fx.publish(upstream)
+
+	service := createPullThroughTestService(t, upstream, fx.publicKey)
+	defer service.Close()
+
+	ts := setupProxyServer(t, service)
+	defer ts.Close()
+
+	proxyGet(t, ts, "/"+fx.narinfoKey, http.StatusOK)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/"+fx.narKey, nil)
+	ok(t, err)
+	req.Header.Set("Range", "bytes=100-199")
+
+	resp, err := http.DefaultClient.Do(req)
+	ok(t, err)
+
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	ok(t, err)
+
+	if resp.StatusCode != http.StatusPartialContent || !bytes.Equal(body, fx.nar[100:200]) {
+		t.Errorf("status=%d len=%d, want 206 and bytes 100-199", resp.StatusCode, len(body))
+	}
+
+	if cr := resp.Header.Get("Content-Range"); cr != "bytes 100-199/8192" {
+		t.Errorf("Content-Range = %q", cr)
+	}
+
+	if got := resp.Header.Get("X-Cache-Status"); got != "MISS" {
+		t.Errorf("X-Cache-Status = %q, want MISS", got)
+	}
+
+	waitForNoFill(ctx, t, service, fx.narKey)
+
+	// A full miss advertises that a resume is possible.
+	header, _ := proxyGet(t, ts, "/"+fx.narKey, http.StatusOK)
+	if got := header.Get("Accept-Ranges"); got != "bytes" {
+		t.Errorf("Accept-Ranges = %q on a miss, want bytes", got)
 	}
 }
 

@@ -349,8 +349,9 @@ func (s *Service) pulledNarMeta(ctx context.Context, narKey string) (narMeta, bo
 
 // fetch tries each upstream in order. It returns errUpstreamNotFound when
 // every upstream answered 404, otherwise the last failure. The caller owns
-// resp.Body.
-func (p *PullThrough) fetch(ctx context.Context, method, key string) (*http.Response, error) {
+// resp.Body. With a Range, a 206 is accepted too; an upstream that ignores
+// the Range answers 200 with the whole object, which is passed on as is.
+func (p *PullThrough) fetch(ctx context.Context, method, key, byteRange string) (*http.Response, error) {
 	var lastErr error
 
 	for _, upstream := range p.upstreams {
@@ -367,6 +368,10 @@ func (p *PullThrough) fetch(ctx context.Context, method, key string) (*http.Resp
 		req.Header.Set("Accept-Encoding", "identity")
 		req.Header.Set("User-Agent", "niks3 pull-through")
 
+		if byteRange != "" {
+			req.Header.Set("Range", byteRange)
+		}
+
 		resp, err := p.client.Do(req) //nolint:gosec // G704: operator-configured upstream
 		if err != nil {
 			lastErr = err
@@ -374,10 +379,11 @@ func (p *PullThrough) fetch(ctx context.Context, method, key string) (*http.Resp
 			continue
 		}
 
-		switch resp.StatusCode {
-		case http.StatusOK:
+		switch {
+		case resp.StatusCode == http.StatusOK,
+			resp.StatusCode == http.StatusPartialContent && byteRange != "":
 			return resp, nil
-		case http.StatusNotFound:
+		case resp.StatusCode == http.StatusNotFound:
 			closeBody(resp)
 		default:
 			closeBody(resp)
@@ -534,7 +540,7 @@ func (s *Service) pullThroughHeadNar(w http.ResponseWriter, r *http.Request, key
 	}
 	defer release()
 
-	resp, err := p.fetch(r.Context(), http.MethodHead, key)
+	resp, err := p.fetch(r.Context(), http.MethodHead, key, "")
 	if err != nil {
 		s.pullThroughUpstreamError(w, r, kindNar, key, err)
 
@@ -544,6 +550,7 @@ func (s *Service) pullThroughHeadNar(w http.ResponseWriter, r *http.Request, key
 	closeBody(resp)
 
 	w.Header().Set("Content-Type", proxyContentType(key, ""))
+	w.Header().Set("Accept-Ranges", "bytes")
 
 	if resp.ContentLength >= 0 {
 		w.Header().Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
@@ -552,6 +559,47 @@ func (s *Service) pullThroughHeadNar(w http.ResponseWriter, r *http.Request, key
 	w.Header().Set(cacheStatusHeader, "MISS")
 	w.WriteHeader(http.StatusOK)
 	s.Metrics.recordPullThrough(kindNar, "miss")
+}
+
+// pullThroughNarRange answers a Range request for a missing NAR straight
+// from upstream without filling. Nix resumes a dropped download with a
+// Range when the first response advertised Accept-Ranges; the partial
+// body is of no use to the bucket, and the fill that the interrupted
+// download started may well still be running.
+func (s *Service) pullThroughNarRange(w http.ResponseWriter, r *http.Request, key string) {
+	p := s.PullThrough
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	resp, err := p.fetch(ctx, http.MethodGet, key, r.Header.Get("Range"))
+	if err != nil {
+		s.pullThroughUpstreamError(w, r, kindNar, key, err)
+
+		return
+	}
+	defer closeBody(resp)
+
+	budget := newTransferBudget(w, cancel, resp.ContentLength, p.idleBudget, key)
+	defer budget.stop()
+
+	w.Header().Set("Content-Type", proxyContentType(key, ""))
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set(cacheStatusHeader, "MISS")
+
+	if cr := resp.Header.Get("Content-Range"); cr != "" {
+		w.Header().Set("Content-Range", cr)
+	}
+
+	if resp.ContentLength >= 0 {
+		w.Header().Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
+	}
+
+	w.WriteHeader(resp.StatusCode)
+
+	n, _ := io.Copy(w, budget.reader(resp.Body))
+	s.Metrics.addPullThroughBytes(n)
+	s.Metrics.recordPullThrough(kindNar, "range")
 }
 
 // pullThroughNarinfo fetches a narinfo upstream, validates it, stores it
@@ -651,7 +699,7 @@ func (p *PullThrough) validateNarinfo(key string, data []byte) (*pulledNarinfo, 
 func (s *Service) fetchNarinfo(w http.ResponseWriter, r *http.Request, key string) (*pulledNarinfo, bool) {
 	p := s.PullThrough
 
-	resp, err := p.fetch(r.Context(), http.MethodGet, key)
+	resp, err := p.fetch(r.Context(), http.MethodGet, key, "")
 	if err != nil {
 		s.pullThroughUpstreamError(w, r, kindNarinfo, key, err)
 
@@ -824,10 +872,16 @@ func (s *Service) pullThroughNar(w http.ResponseWriter, r *http.Request, key str
 	s.Metrics.pullThroughInFlightAdd(1)
 	defer s.Metrics.pullThroughInFlightAdd(-1)
 
+	if r.Header.Get("Range") != "" {
+		s.pullThroughNarRange(w, r, key)
+
+		return
+	}
+
 	ctx, cancel := context.WithCancel(context.WithoutCancel(r.Context()))
 	defer cancel()
 
-	resp, err := p.fetch(ctx, http.MethodGet, key)
+	resp, err := p.fetch(ctx, http.MethodGet, key, "")
 	if err != nil {
 		s.pullThroughUpstreamError(w, r, kindNar, key, err)
 
@@ -855,6 +909,9 @@ func (s *Service) pullThroughNar(w http.ResponseWriter, r *http.Request, key str
 
 	w.Header().Set("Content-Type", proxyContentType(key, ""))
 	w.Header().Set(cacheStatusHeader, "MISS")
+	// Lets Nix resume a dropped download with a Range instead of failing
+	// it; the Range is then passed through to upstream.
+	w.Header().Set("Accept-Ranges", "bytes")
 
 	if size >= 0 {
 		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
