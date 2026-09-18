@@ -779,6 +779,39 @@ func (q *Queries) ReleaseClaim(ctx context.Context, token int64) error {
 	return err
 }
 
+const resurrectReachableObjects = `-- name: ResurrectReachableObjects :execrows
+WITH RECURSIVE closure_reach AS (
+    SELECT o.key, o.refs
+    FROM objects o
+    INNER JOIN closures c ON o.key = c.key
+    UNION
+    SELECT o.key, o.refs
+    FROM objects o
+    INNER JOIN closure_reach cr ON o.key = ANY(cr.refs)
+)
+
+UPDATE objects
+SET deleted_at = NULL, first_deleted_at = NULL
+WHERE objects.deleted_at IS NOT NULL
+  AND EXISTS (
+      SELECT 1 FROM closure_reach cr
+      WHERE cr.key = objects.key
+  )
+`
+
+// Clear the tombstone of objects that became reachable again after they
+// were marked: a pull-through fill re-rooted a narinfo whose NAR was still
+// tombstoned, or an upload re-offered them. Runs under the GC lock before
+// the tombstones are read for S3 deletion, so no delete can be in flight
+// for these keys and their S3 objects are known to exist.
+func (q *Queries) ResurrectReachableObjects(ctx context.Context) (int64, error) {
+	result, err := q.db.Exec(ctx, resurrectReachableObjects)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const touchClosures = `-- name: TouchClosures :exec
 UPDATE closures SET updated_at = timezone('UTC', now())
 WHERE key = any($1::varchar [])
