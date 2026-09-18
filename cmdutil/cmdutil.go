@@ -60,10 +60,13 @@ func envAuthTokenPath() string {
 }
 
 // ResolveTokenSource picks a client.TokenSource from the auth flags, in
-// priority order: script > file > literal token > env/XDG file. All file
-// sources (--auth-token-path, NIKS3_AUTH_TOKEN_FILE, the XDG default) get
-// the same FileToken behavior with periodic re-reads, so an external
-// refresher rotating the file works regardless of how the path was supplied.
+// priority order: script > file > literal token, then the environment:
+// NIKS3_AUTH_TOKEN_SCRIPT > NIKS3_AUTH_TOKEN_FILE > XDG default file. Any
+// explicit flag beats any env var so a one-off --auth-token-path still works
+// in a shell that exports NIKS3_AUTH_TOKEN_SCRIPT. All file sources
+// (--auth-token-path, NIKS3_AUTH_TOKEN_FILE, the XDG default) get the same
+// FileToken behavior with periodic re-reads, so an external refresher
+// rotating the file works regardless of how the path was supplied.
 // hasMTLS reports whether a client certificate is configured — in which
 // case the transport carries the credential and no bearer token is needed.
 func ResolveTokenSource(flagToken, flagTokenPath, flagTokenScript string, hasMTLS bool) (client.TokenSource, error) {
@@ -76,6 +79,10 @@ func ResolveTokenSource(flagToken, flagTokenPath, flagTokenScript string, hasMTL
 		return client.StaticToken(flagToken), nil
 	}
 
+	if s := os.Getenv("NIKS3_AUTH_TOKEN_SCRIPT"); s != "" {
+		return client.ScriptToken(s), nil
+	}
+
 	if p := envAuthTokenPath(); p != "" {
 		return client.FileToken(p), nil
 	}
@@ -84,7 +91,7 @@ func ResolveTokenSource(flagToken, flagTokenPath, flagTokenScript string, hasMTL
 		return client.NoToken(), nil
 	}
 
-	return nil, errors.New("auth token is required (use --auth-token-path, --auth-token-script, NIKS3_AUTH_TOKEN_FILE, or $XDG_CONFIG_HOME/niks3/auth-token)")
+	return nil, errors.New("auth token is required (use --auth-token-path, --auth-token-script, NIKS3_AUTH_TOKEN_SCRIPT, NIKS3_AUTH_TOKEN_FILE, or $XDG_CONFIG_HOME/niks3/auth-token)")
 }
 
 // CommonFlags holds pointers to flags shared across subcommands.
@@ -116,8 +123,9 @@ func AddCommonFlags(fs *flag.FlagSet) CommonFlags {
 
 // TokenSource resolves the auth flags via ResolveTokenSource and warns if
 // the deprecated --auth-token flag was set explicitly on the command line
-// (as opposed to being filled in from NIKS3_AUTH_TOKEN_FILE or the XDG
-// default). fs must be the FlagSet the flags were registered on.
+// (as opposed to being filled in from NIKS3_AUTH_TOKEN_SCRIPT,
+// NIKS3_AUTH_TOKEN_FILE, or the XDG default). fs must be the FlagSet the
+// flags were registered on.
 // tf may be the zero value if the command has no TLS flags.
 func (cf CommonFlags) TokenSource(fs *flag.FlagSet, tf TLSFlags) (client.TokenSource, error) {
 	fs.Visit(func(f *flag.Flag) {
@@ -143,9 +151,10 @@ func RequireServerURL(url string) error {
 //nolint:gosec // G101: help text, not credentials
 const AuthTokenHelp = `  --auth-token string
         DEPRECATED: tokens passed on the command line are visible in /proc and
-        shell history. Use --auth-token-path, --auth-token-script, or
-        NIKS3_AUTH_TOKEN_FILE instead.
-        When unset, falls back to NIKS3_AUTH_TOKEN_FILE or $XDG_CONFIG_HOME/niks3/auth-token`
+        shell history. Use --auth-token-path, --auth-token-script,
+        NIKS3_AUTH_TOKEN_SCRIPT, or NIKS3_AUTH_TOKEN_FILE instead.
+        When unset, falls back to NIKS3_AUTH_TOKEN_SCRIPT, NIKS3_AUTH_TOKEN_FILE,
+        or $XDG_CONFIG_HOME/niks3/auth-token`
 
 //nolint:gosec // G101: help text, not credentials
 const AuthTokenPathHelp = `  --auth-token-path string
@@ -155,7 +164,8 @@ const AuthTokenPathHelp = `  --auth-token-path string
 //nolint:gosec // G101: help text, not credentials
 const AuthTokenScriptHelp = `  --auth-token-script string
         Command that prints {"token":"...","expires_at":"RFC3339"} on stdout.
-        Run on first use and again before expiry. Use for short-lived OIDC tokens`
+        Run on first use and again before expiry. Use for short-lived OIDC tokens
+        (can also use NIKS3_AUTH_TOKEN_SCRIPT env var)`
 
 const TLSHelp = `  --client-cert string
         Client certificate file for mTLS authentication
