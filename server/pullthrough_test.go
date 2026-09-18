@@ -1125,6 +1125,88 @@ func TestPullThroughFillSurvivesClientDisconnect(t *testing.T) {
 	}
 }
 
+func TestPullThroughRedirectUsesDatabase(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	upstream := newFakeUpstream(t)
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 2048))
+	fx.publish(upstream)
+
+	service := createPullThroughTestService(t, upstream, fx.publicKey)
+	defer service.Close()
+
+	service.ReadRedirectTTL = time.Minute
+
+	ts := setupProxyServer(t, service)
+	defer ts.Close()
+
+	noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+
+	// get drains and closes the body; redirects are not followed.
+	get := func(key string) (int, http.Header) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/"+key, nil)
+		ok(t, err)
+
+		resp, err := noRedirect.Do(req)
+		ok(t, err)
+
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+
+		return resp.StatusCode, resp.Header
+	}
+
+	proxyGet(t, ts, "/"+fx.narinfoKey, http.StatusOK)
+
+	// Untracked and absent: filled from upstream and streamed.
+	status, header := get(fx.narKey)
+	if status != http.StatusOK || header.Get("X-Cache-Status") != "MISS" {
+		t.Fatalf("first read: status=%d cache=%q", status, header.Get("X-Cache-Status"))
+	}
+
+	waitForFill(ctx, t, service, fx.narKey)
+
+	// Now tracked: redirected on the strength of the objects row.
+	status, header = get(fx.narKey)
+	if status != http.StatusTemporaryRedirect {
+		t.Fatalf("tracked read: status=%d, want 307", status)
+	}
+
+	if loc := header.Get("Location"); !strings.Contains(loc, fx.narKey) {
+		t.Errorf("Location = %q", loc)
+	}
+
+	// Present in S3 but unknown to the database (written outside niks3):
+	// the S3 fallback still redirects instead of refilling.
+	foreign := "nar/" + strings.Repeat("z", 52) + ".nar.zst"
+	putTestObject(ctx, t, service, foreign, []byte("foreign"), minio.PutObjectOptions{})
+
+	if status, _ = get(foreign); status != http.StatusTemporaryRedirect {
+		t.Errorf("foreign object: status=%d, want 307", status)
+	}
+
+	if n := upstream.hitCount(foreign); n != 0 {
+		t.Errorf("foreign object reached upstream %d times", n)
+	}
+
+	// Tombstoned rows do not count as live: with the object gone from S3
+	// the read falls through to upstream again.
+	_, err := service.Pool.Exec(ctx, "UPDATE objects SET deleted_at = now(), first_deleted_at = now() WHERE key = $1", fx.narKey)
+	ok(t, err)
+	ok(t, service.MinioClient.RemoveObject(ctx, service.Bucket, fx.narKey, minio.RemoveObjectOptions{}))
+
+	status, header = get(fx.narKey)
+	if status != http.StatusOK || header.Get("X-Cache-Status") != "MISS" {
+		t.Errorf("after tombstone: status=%d cache=%q", status, header.Get("X-Cache-Status"))
+	}
+
+	// The refill resurrects the row.
+	waitForFill(ctx, t, service, fx.narKey)
+}
+
 func TestNewPullThroughValidation(t *testing.T) {
 	t.Parallel()
 
