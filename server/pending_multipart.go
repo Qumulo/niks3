@@ -90,8 +90,10 @@ func (s *Service) createMultipartUpload(ctx context.Context, pendingClosureID in
 	}
 
 	// Initiate multipart upload
+	// The parts carry no type of their own: the object's Content-Type is
+	// fixed here, so use the one Nix's binary cache stores give NARs.
 	uploadID, err := coreClient.NewMultipartUpload(ctx, s.Bucket, objectKey, minio.PutObjectOptions{
-		ContentType: "application/octet-stream",
+		ContentType: "application/x-nix-nar",
 	})
 	if err != nil {
 		if isRateLimitError(err) {
