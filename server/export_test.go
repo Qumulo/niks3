@@ -136,3 +136,6 @@ func (s *Service) SetTestHookBeforeRedundantAbort(f func()) {
 func (s *Service) SetTestHookBeforeProxyGet(f func()) {
 	s.testHookBeforeProxyGet = f
 }
+
+// ProxyContentType is an export of proxyContentType for tests.
+func ProxyContentType(key, reported string) string { return proxyContentType(key, reported) }
