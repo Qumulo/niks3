@@ -53,6 +53,40 @@ presigned S3 URL instead of being streamed, so NAR bytes bypass niks3. Narinfos
 and other metadata stay proxied. Note that anyone holding such a URL can fetch
 that object until it expires, regardless of read-proxy authentication.
 
+### Pull-through (optional)
+
+```mermaid
+flowchart LR
+    nix[Nix Client] -->|read request| niks3[niks3 Server]
+    niks3 -->|miss| upstream[(cache.nixos.org)]
+    niks3 -->|store + track| s3[(S3 Bucket)]
+    niks3 -->|stream| nix
+```
+
+With `--pull-through-upstream https://cache.nixos.org` the read proxy behaves
+like [nixos-passthru-cache](https://github.com/numtide/nixos-passthru-cache):
+a narinfo the bucket lacks is fetched from the upstream, streamed to the
+client and stored in the bucket, so the next reader is served from S3.
+Only narinfos are filled so far; NARs, listings, logs and realisations still 404.
+
+- Upstream narinfos are stored byte for byte, so their signatures stay valid.
+  niks3 does not re-sign them. Clients keep the upstream's key in
+  `trusted-public-keys` alongside niks3's own.
+- `--trusted-key cache.nixos.org-1:...` refuses to serve or store
+  narinfos that no listed key signed. The public keys of `--sign-key-path`
+  are always in the list, so pull-through needs one or the other.
+- Pulled narinfos are tracked as *pull-through closures* that record the
+  trusted signature they were verified with. They age and expire under the
+  same GC `--older-than` as uploaded closures; reads do not refresh either.
+- Upstream 404s are remembered for `--pull-through-negative-ttl` (default 1m).
+  Responses carry `X-Cache-Status: HIT`, `MISS` or `NEGATIVE`.
+- Narinfo fills are bounded by `--pull-through-narinfo-concurrency` (default
+  256); they are a few KiB each, so this bounds upstream connections rather
+  than memory.
+
+If clients list both caches as substituters, keep niks3's `--cache-priority`
+below cache.nixos.org's 40 (the default is 30), or Nix never asks niks3 first.
+
 ## Features
 
 ### Binary Cache Protocol Support
