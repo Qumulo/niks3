@@ -82,6 +82,8 @@ Only narinfos and NARs are filled; listings, logs and realisations still 404.
 - Pulled narinfos are tracked as *pull-through closures* that record the
   trusted signature they were verified with. They age and expire under the
   same GC `--older-than` as uploaded closures; reads do not refresh either.
+  GC also expires pull-through closures signed by a key since removed from
+  the trusted list. Pinned closures are kept and reported.
 - Upstream 404s are remembered for `--pull-through-negative-ttl` (default 1m).
   Responses carry `X-Cache-Status: HIT`, `MISS` or `NEGATIVE`.
 - `--pull-through-concurrency` (default 16) bounds NAR fills, each of which may
