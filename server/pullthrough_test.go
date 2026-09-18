@@ -21,6 +21,7 @@ import (
 
 	"github.com/Mic92/niks3/client"
 	"github.com/Mic92/niks3/server"
+	"github.com/Mic92/niks3/server/pg"
 	"github.com/Mic92/niks3/server/signing"
 	"github.com/jackc/pgx/v5"
 	"github.com/klauspost/compress/zstd"
@@ -332,6 +333,13 @@ func waitForNoFill(ctx context.Context, tb testing.TB, service *server.Service, 
 	if _, _, found := getObjectRow(ctx, tb, service, key); found {
 		tb.Errorf("%s was registered", key)
 	}
+}
+
+func setClosureAge(ctx context.Context, tb testing.TB, service *server.Service, key string, age time.Duration) {
+	tb.Helper()
+
+	_, err := service.Pool.Exec(ctx, "UPDATE closures SET updated_at = $2 WHERE key = $1", key, time.Now().UTC().Add(-age))
+	ok(tb, err)
 }
 
 func TestPullThroughNarinfoMissThenHit(t *testing.T) {
@@ -713,6 +721,58 @@ func TestPullThroughTrustedKeys(t *testing.T) {
 	// The closure records which signature vouched for it.
 	if row, found := getClosureRow(ctx, t, service, fx.narinfoKey); !found || row.pulledSig.String != fx.sig {
 		t.Errorf("closure row = %+v found=%v, want pulled_sig %q", row, found, fx.sig)
+	}
+}
+
+// A native upload of a path the read proxy pulled earlier takes the root
+// over: pulled_sig becomes NULL and the trusted-key expiry no longer
+// applies to it.
+func TestPullThroughUploadTakesOverPulledClosure(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	upstream := newFakeUpstream(t)
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 64))
+	fx.publish(upstream)
+
+	service := createPullThroughTestService(t, upstream, fx.publicKey)
+	defer service.Close()
+
+	ts := setupProxyServer(t, service)
+	defer ts.Close()
+
+	proxyGet(t, ts, "/"+fx.narinfoKey, http.StatusOK)
+
+	row, found := getClosureRow(ctx, t, service, fx.narinfoKey)
+	if !found || row.pulledSig.String != fx.sig {
+		t.Fatalf("closure row = %+v found=%v, want pulled_sig %q", row, found, fx.sig)
+	}
+
+	createTestClosure(t, service, pg.New(service.Pool), fx.hash)
+
+	row, found = getClosureRow(ctx, t, service, fx.narinfoKey)
+	if !found || row.pulledSig.Valid {
+		t.Fatalf("closure row = %+v found=%v after upload, want pulled_sig NULL", row, found)
+	}
+
+	// Dropping the key that signed the pull no longer matters.
+	other := newFixtureSignedBy(t, "4hcdxyjf9yiq7qf3i4548drb6sjmwa1v", randomNar(t, 16), "signer-2")
+	service.PullThrough, _ = server.NewPullThrough(server.PullThroughConfig{
+		Upstreams:   []string{upstream.srv.URL},
+		TrustedKeys: []string{other.publicKey},
+	})
+
+	status := service.RunGCForTest(365*24*time.Hour, time.Hour, true)
+	if status.Error != "" {
+		t.Fatalf("GC failed: %s", status.Error)
+	}
+
+	if status.Stats.PulledClosuresUntrusted != 0 {
+		t.Errorf("stats = %+v, want no closure expired", status.Stats)
+	}
+
+	if _, found := getClosureRow(ctx, t, service, fx.narinfoKey); !found {
+		t.Error("uploaded closure was expired by the trusted-key sweep")
 	}
 }
 
@@ -1207,6 +1267,123 @@ func TestPullThroughRedirectUsesDatabase(t *testing.T) {
 	waitForFill(ctx, t, service, fx.narKey)
 }
 
+// Pulled and uploaded closures age under the same GC cutoff.
+func TestPullThroughGCSameAgeAsUploads(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	upstream := newFakeUpstream(t)
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 64))
+	fx.publish(upstream)
+
+	service := createPullThroughTestService(t, upstream, fx.publicKey)
+	defer service.Close()
+
+	ts := setupProxyServer(t, service)
+	defer ts.Close()
+
+	proxyGet(t, ts, "/"+fx.narinfoKey, http.StatusOK)
+	proxyGet(t, ts, "/"+fx.narKey, http.StatusOK)
+	waitForFill(ctx, t, service, fx.narKey)
+
+	// A native closure of the same age for comparison.
+	queries := pg.New(service.Pool)
+	createTestClosure(t, service, queries, "4hcdxyjf9yiq7qf3i4548drb6sjmwa1v")
+
+	setClosureAge(ctx, t, service, fx.narinfoKey, 10*24*time.Hour)
+	setClosureAge(ctx, t, service, "4hcdxyjf9yiq7qf3i4548drb6sjmwa1v.narinfo", 10*24*time.Hour)
+
+	status := service.RunGCForTest(30*24*time.Hour, time.Hour, true)
+	if status.Error != "" {
+		t.Fatalf("GC failed: %s", status.Error)
+	}
+
+	if status.Stats.OldClosuresDeleted != 0 {
+		t.Fatalf("stats = %+v, want nothing deleted under a 30d cutoff", status.Stats)
+	}
+
+	if !hasPulledNarRow(ctx, t, service, fx.narKey) {
+		t.Fatal("NAR metadata was swept while its narinfo is tracked")
+	}
+
+	// A one-day cutoff expires both, and the orphan sweep removes the
+	// pulled objects from S3.
+	status = service.RunGCForTest(24*time.Hour, time.Hour, true)
+	if status.Error != "" {
+		t.Fatalf("GC failed: %s", status.Error)
+	}
+
+	if status.Stats.OldClosuresDeleted != 2 {
+		t.Fatalf("stats = %+v, want both closures deleted", status.Stats)
+	}
+
+	for _, key := range []string{fx.narinfoKey, fx.narKey} {
+		if _, _, found := s3Object(ctx, t, service, key); found {
+			t.Errorf("%s survived GC", key)
+		}
+	}
+
+	if hasPulledNarRow(ctx, t, service, fx.narKey) {
+		t.Error("NAR metadata survived its narinfo")
+	}
+
+	// And the next read fills again.
+	header, _ := proxyGet(t, ts, "/"+fx.narinfoKey, http.StatusOK)
+	if header.Get("X-Cache-Status") != "MISS" {
+		t.Errorf("post-GC read: X-Cache-Status = %q, want MISS", header.Get("X-Cache-Status"))
+	}
+}
+
+// GC deletes from S3 first and flushes the matching rows in batches of a
+// thousand, so a fill can resurrect a row in between. The flush must not
+// take the fresh row down with the stale ones.
+func TestPullThroughFillSurvivesGCRowFlush(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	upstream := newFakeUpstream(t)
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 64))
+	fx.publish(upstream)
+
+	service := createPullThroughTestService(t, upstream, fx.publicKey)
+	defer service.Close()
+
+	ts := setupProxyServer(t, service)
+	defer ts.Close()
+
+	proxyGet(t, ts, "/"+fx.narinfoKey, http.StatusOK)
+	proxyGet(t, ts, "/"+fx.narKey, http.StatusOK)
+	waitForFill(ctx, t, service, fx.narKey)
+
+	// GC has tombstoned both, removed them from S3 and is about to flush
+	// the rows.
+	_, err := service.Pool.Exec(ctx,
+		"UPDATE objects SET deleted_at = now(), first_deleted_at = now() WHERE key = any($1)",
+		[]string{fx.narinfoKey, fx.narKey})
+	ok(t, err)
+
+	for _, key := range []string{fx.narinfoKey, fx.narKey} {
+		ok(t, service.MinioClient.RemoveObject(ctx, service.Bucket, key, minio.RemoveObjectOptions{}))
+	}
+
+	// A reader refills both before the flush lands.
+	proxyGet(t, ts, "/"+fx.narinfoKey, http.StatusOK)
+	proxyGet(t, ts, "/"+fx.narKey, http.StatusOK)
+	waitForFill(ctx, t, service, fx.narKey)
+
+	ok(t, pg.New(service.Pool).DeleteObjects(ctx, []string{fx.narinfoKey, fx.narKey}))
+
+	for _, key := range []string{fx.narinfoKey, fx.narKey} {
+		if _, live, found := getObjectRow(ctx, t, service, key); !found || !live {
+			t.Errorf("%s: row found=%v live=%v after the GC flush, want a live row", key, found, live)
+		}
+	}
+
+	if row, found := getClosureRow(ctx, t, service, fx.narinfoKey); !found || !row.pulledSig.Valid {
+		t.Errorf("closure row = %+v found=%v, want pulled", row, found)
+	}
+}
+
 func TestNewPullThroughValidation(t *testing.T) {
 	t.Parallel()
 
@@ -1234,6 +1411,147 @@ func TestNewPullThroughValidation(t *testing.T) {
 
 	if got := strings.Join(p.Upstreams(), " "); got != "https://cache.nixos.org http://mirror:8080/cache" {
 		t.Errorf("Upstreams = %q", got)
+	}
+}
+
+// A narinfo re-fill roots its NAR again while the NAR's row may still be
+// tombstoned from the closure's expiry. GC must keep the reachable NAR
+// rather than delete it from S3 after the grace period, which would cost
+// a full upstream refetch on the next read.
+func TestPullThroughGCKeepsReachableTombstonedNar(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	upstream := newFakeUpstream(t)
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 64))
+	fx.publish(upstream)
+
+	service := createPullThroughTestService(t, upstream, fx.publicKey)
+	defer service.Close()
+
+	ts := setupProxyServer(t, service)
+	defer ts.Close()
+
+	proxyGet(t, ts, "/"+fx.narinfoKey, http.StatusOK)
+	proxyGet(t, ts, "/"+fx.narKey, http.StatusOK)
+	waitForFill(ctx, t, service, fx.narKey)
+
+	// The closure expires; a non-force GC tombstones both objects but
+	// leaves them in S3 for the grace period.
+	setClosureAge(ctx, t, service, fx.narinfoKey, 2*24*time.Hour)
+
+	if status := service.RunGCForTest(24*time.Hour, time.Hour, false); status.Error != "" {
+		t.Fatalf("GC failed: %s", status.Error)
+	}
+
+	for _, key := range []string{fx.narinfoKey, fx.narKey} {
+		if _, live, found := getObjectRow(ctx, t, service, key); !found || live {
+			t.Fatalf("%s: found=%v live=%v after expiry, want a tombstoned row", key, found, live)
+		}
+	}
+
+	// Only the narinfo is gone from S3 when a reader comes back: the
+	// re-fill roots it, and with it the NAR that is still in the bucket.
+	ok(t, service.MinioClient.RemoveObject(ctx, service.Bucket, fx.narinfoKey, minio.RemoveObjectOptions{}))
+	ok(t, pg.New(service.Pool).DeleteObjects(ctx, []string{fx.narinfoKey}))
+
+	header, _ := proxyGet(t, ts, "/"+fx.narinfoKey, http.StatusOK)
+	if header.Get("X-Cache-Status") != "MISS" {
+		t.Fatalf("X-Cache-Status = %q, want MISS", header.Get("X-Cache-Status"))
+	}
+
+	if _, live, found := getObjectRow(ctx, t, service, fx.narKey); !found || live {
+		t.Fatalf("NAR row found=%v live=%v after the narinfo re-fill, want still tombstoned", found, live)
+	}
+
+	// The grace period has passed by the next GC. The NAR is reachable
+	// again, so it must be kept, not deleted.
+	_, err := service.Pool.Exec(ctx,
+		"UPDATE objects SET first_deleted_at = first_deleted_at - interval '1 day' WHERE key = $1", fx.narKey)
+	ok(t, err)
+
+	if status := service.RunGCForTest(24*time.Hour, time.Hour, false); status.Error != "" {
+		t.Fatalf("GC failed: %s", status.Error)
+	}
+
+	if _, live, found := getObjectRow(ctx, t, service, fx.narKey); !found || !live {
+		t.Errorf("NAR row found=%v live=%v after GC, want live", found, live)
+	}
+
+	if _, _, found := s3Object(ctx, t, service, fx.narKey); !found {
+		t.Error("NAR was deleted from S3 although its narinfo roots it again")
+	}
+}
+
+// Once a key leaves the trusted set, GC expires every closure that key
+// vouched for. A pin holds its closure through that, as through the other
+// expiries. Keys are told apart by name, as Nix does, so each fixture
+// here signs under its own name.
+func TestPullThroughGCExpiresUntrustedKeys(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	upstream := newFakeUpstream(t)
+	signed := newFixtureSignedBy(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 64), "signer-1")
+	pinned := newFixtureSignedBy(t, "0000000000000000000000000000000a", randomNar(t, 64), "signer-2")
+	replacement := newFixtureSignedBy(t, "4hcdxyjf9yiq7qf3i4548drb6sjmwa1v", randomNar(t, 64), "signer-3")
+
+	signed.publish(upstream)
+	pinned.publish(upstream)
+
+	service := createPullThroughTestService(t, upstream, signed.publicKey, pinned.publicKey)
+	defer service.Close()
+
+	ts := setupProxyServer(t, service)
+	defer ts.Close()
+
+	proxyGet(t, ts, "/"+signed.narinfoKey, http.StatusOK)
+	proxyGet(t, ts, "/"+pinned.narinfoKey, http.StatusOK)
+
+	queries := pg.New(service.Pool)
+	ok(t, queries.UpsertPin(ctx, pg.UpsertPinParams{
+		Name:       "held",
+		NarinfoKey: pinned.narinfoKey,
+		StorePath:  "/nix/store/" + pinned.hash + "-hello-2.12.1",
+	}))
+
+	// With the same keys still trusted nothing expires.
+	status := service.RunGCForTest(365*24*time.Hour, time.Hour, true)
+	if status.Error != "" {
+		t.Fatalf("GC failed: %s", status.Error)
+	}
+
+	if status.Stats.PulledClosuresUntrusted != 0 {
+		t.Fatalf("stats = %+v, want nothing expired", status.Stats)
+	}
+
+	// Replace both keys: the signer's closure goes, the pinned one is held.
+	service.PullThrough, _ = server.NewPullThrough(server.PullThroughConfig{
+		Upstreams:   []string{upstream.srv.URL},
+		TrustedKeys: []string{replacement.publicKey},
+	})
+
+	status = service.RunGCForTest(365*24*time.Hour, time.Hour, true)
+	if status.Error != "" {
+		t.Fatalf("GC failed: %s", status.Error)
+	}
+
+	if status.Stats.PulledClosuresUntrusted != 1 {
+		t.Fatalf("stats = %+v, want 1 closure expired for its dropped key", status.Stats)
+	}
+
+	if _, found := getClosureRow(ctx, t, service, signed.narinfoKey); found {
+		t.Error("closure signed by a dropped key survived")
+	}
+
+	if _, found := getClosureRow(ctx, t, service, pinned.narinfoKey); !found {
+		t.Error("pinned closure was expired")
+	}
+
+	for key, want := range map[string]bool{signed.narinfoKey: false, pinned.narinfoKey: true} {
+		if _, _, found := s3Object(ctx, t, service, key); found != want {
+			t.Errorf("%s in S3 = %v, want %v", key, found, want)
+		}
 	}
 }
 
