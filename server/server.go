@@ -626,7 +626,7 @@ func (s *Service) InitializeBucket(ctx context.Context) error {
 		return fmt.Errorf("uploading nix-cache-info: %w", err)
 	}
 
-	err := s.putSmallObject(ctx, "nix-cache-info", []byte(cacheInfo), "text/plain")
+	err := s.putSmallObject(ctx, "nix-cache-info", []byte(cacheInfo), "text/x-nix-cache-info")
 	if err != nil {
 		if isRateLimitError(err) {
 			s.S3RateLimiter.RecordThrottle()
