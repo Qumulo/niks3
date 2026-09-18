@@ -205,6 +205,94 @@ func TestReadProxyNarinfoAlreadyDecompressed(t *testing.T) {
 	}
 }
 
+// Listings, build logs and realisations are uploaded zstd-compressed with
+// a Content-Encoding, like narinfos, and Nix reads them as plain bytes.
+// The proxy decompresses them whether or not the store kept the header.
+func TestReadProxyDecompressesMetadataObjects(t *testing.T) {
+	t.Parallel()
+
+	service := createProxyTestService(t)
+	defer service.Close()
+
+	ctx := t.Context()
+
+	// A log big enough that it has to be streamed, not buffered.
+	logPlain := bytes.Repeat([]byte("building /nix/store/abc-foo... done\n"), 100_000)
+
+	cases := []struct {
+		key        string
+		plain      []byte
+		compressed bool
+		encoding   string
+		wantType   string
+	}{
+		{"log/abc-foo.drv", logPlain, true, "zstd", "text/plain; charset=utf-8"},
+		{"log/plain-foo.drv", []byte("plain log\n"), false, "", "text/plain; charset=utf-8"},
+		{"26xbg1ndr7hbcncrlf9nhx5is2b25d13.ls", []byte(`{"version":1,"root":{}}`), true, "", "application/json"},
+		{"realisations/sha256:abc!out.doi", []byte(`{"id":"sha256:abc!out"}`), true, "zstd", "application/json"},
+	}
+
+	for _, tc := range cases {
+		data := tc.plain
+		if tc.compressed {
+			data = zstdCompress(t, tc.plain)
+		}
+
+		putTestObject(ctx, t, service, tc.key, data,
+			minio.PutObjectOptions{ContentType: tc.wantType, ContentEncoding: tc.encoding})
+	}
+
+	ts := setupProxyServer(t, service)
+	defer ts.Close()
+
+	for _, tc := range cases {
+		header, body := proxyGet(t, ts, "/"+tc.key, http.StatusOK)
+
+		if !bytes.Equal(body, tc.plain) {
+			t.Errorf("%s: body mismatch (got %d bytes, want %d)", tc.key, len(body), len(tc.plain))
+		}
+
+		if ct := header.Get("Content-Type"); ct != tc.wantType {
+			t.Errorf("%s: Content-Type = %q, want %q", tc.key, ct, tc.wantType)
+		}
+
+		if ce := header.Get("Content-Encoding"); ce != "" {
+			t.Errorf("%s: Content-Encoding = %q, want none", tc.key, ce)
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodHead, ts.URL+"/"+tc.key, nil)
+		ok(t, err)
+
+		resp, err := http.DefaultClient.Do(req)
+		ok(t, err)
+
+		_ = resp.Body.Close()
+
+		// The stored size is not the served size, so HEAD must not claim one.
+		if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Length") != "" {
+			t.Errorf("%s: HEAD status=%d Content-Length=%q", tc.key, resp.StatusCode, resp.Header.Get("Content-Length"))
+		}
+	}
+}
+
+func TestReadProxyCorruptCompressedObject(t *testing.T) {
+	t.Parallel()
+
+	service := createProxyTestService(t)
+	defer service.Close()
+
+	ctx := t.Context()
+
+	// A zstd magic number followed by garbage.
+	putTestObject(ctx, t, service, "log/abc-foo.drv", append([]byte("\x28\xb5\x2f\xfd"), []byte("not a frame")...),
+		minio.PutObjectOptions{ContentType: "text/plain; charset=utf-8", ContentEncoding: "zstd"})
+
+	ts := setupProxyServer(t, service)
+	defer ts.Close()
+
+	proxyGet(t, ts, "/log/abc-foo.drv", http.StatusBadGateway)
+}
+
 func TestReadProxyNarStreaming(t *testing.T) {
 	t.Parallel()
 
