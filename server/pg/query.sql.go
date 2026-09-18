@@ -642,6 +642,49 @@ func (q *Queries) ListPins(ctx context.Context) ([]Pin, error) {
 	return items, nil
 }
 
+const listReachableTombstonedObjects = `-- name: ListReachableTombstonedObjects :many
+WITH RECURSIVE closure_reach AS (
+    SELECT o.key, o.refs
+    FROM objects o
+    INNER JOIN closures c ON o.key = c.key
+    UNION
+    SELECT o.key, o.refs
+    FROM objects o
+    INNER JOIN closure_reach cr ON o.key = ANY(cr.refs)
+)
+
+SELECT objects.key
+FROM objects
+WHERE objects.deleted_at IS NOT NULL
+  AND EXISTS (
+      SELECT 1 FROM closure_reach cr
+      WHERE cr.key = objects.key
+  )
+`
+
+// Tombstoned objects that became reachable again after they were marked: a
+// pull-through fill re-rooted a narinfo whose NAR was still tombstoned, or an
+// upload re-offered them.
+func (q *Queries) ListReachableTombstonedObjects(ctx context.Context) ([]string, error) {
+	rows, err := q.db.Query(ctx, listReachableTombstonedObjects)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		items = append(items, key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockObjectsReadyForDeletion = `-- name: LockObjectsReadyForDeletion :many
 SELECT key
 FROM objects
@@ -896,6 +939,21 @@ type RegisterPulledObjectParams struct {
 func (q *Queries) RegisterPulledObject(ctx context.Context, arg RegisterPulledObjectParams) error {
 	_, err := q.db.Exec(ctx, registerPulledObject, arg.Key, arg.Refs, arg.Size)
 	return err
+}
+
+const resurrectObjects = `-- name: ResurrectObjects :execrows
+UPDATE objects
+SET deleted_at = NULL, first_deleted_at = NULL
+WHERE key = ANY($1::varchar [])
+  AND deleted_at IS NOT NULL
+`
+
+func (q *Queries) ResurrectObjects(ctx context.Context, keys []string) (int64, error) {
+	result, err := q.db.Exec(ctx, resurrectObjects, keys)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const touchPresentClosures = `-- name: TouchPresentClosures :many

@@ -312,6 +312,34 @@ SELECT pending_closure_id, object_key, upload_id
 FROM multipart_uploads
 WHERE upload_id = $1 AND object_key = $2;
 
+-- name: ListReachableTombstonedObjects :many
+-- Tombstoned objects that became reachable again after they were marked: a
+-- pull-through fill re-rooted a narinfo whose NAR was still tombstoned, or an
+-- upload re-offered them.
+WITH RECURSIVE closure_reach AS (
+    SELECT o.key, o.refs
+    FROM objects o
+    INNER JOIN closures c ON o.key = c.key
+    UNION
+    SELECT o.key, o.refs
+    FROM objects o
+    INNER JOIN closure_reach cr ON o.key = ANY(cr.refs)
+)
+
+SELECT objects.key
+FROM objects
+WHERE objects.deleted_at IS NOT NULL
+  AND EXISTS (
+      SELECT 1 FROM closure_reach cr
+      WHERE cr.key = objects.key
+  );
+
+-- name: ResurrectObjects :execrows
+UPDATE objects
+SET deleted_at = NULL, first_deleted_at = NULL
+WHERE key = ANY(sqlc.arg(keys)::varchar [])
+  AND deleted_at IS NOT NULL;
+
 -- name: MarkStaleObjects :execrows
 WITH RECURSIVE ct AS (
     SELECT timezone('UTC', now()) AS now

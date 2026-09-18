@@ -11,6 +11,7 @@ import (
 	"github.com/Mic92/niks3/server/pg"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	minio "github.com/minio/minio-go/v7"
 )
 
 // The pulled-closure bookkeeping exercised on its own, before anything
@@ -247,6 +248,101 @@ func TestGCSweepsOrphanedPulledNars(t *testing.T) {
 
 	if _, err := queries.GetPulledNar(ctx, narKey); !errors.Is(err, pgx.ErrNoRows) {
 		t.Errorf("GetPulledNar after the sweep: err=%v, want no rows", err)
+	}
+}
+
+// A tombstoned object can become reachable again without anything
+// touching its row: a closure is rooted again by registering only its
+// narinfo, as a read proxy filling from upstream does, while the NAR the
+// narinfo references is still tombstoned from the closure's earlier
+// expiry. GC must clear that tombstone rather than delete a reachable
+// object from S3 once the grace period is over.
+// expireAndReroot leaves a closure's NAR tombstoned and past its grace
+// period while its narinfo alone is registered and rooted again, as a
+// pull-through fill does, and returns the NAR's key.
+func expireAndReroot(t *testing.T, service *server.Service, queries *pg.Queries) string {
+	t.Helper()
+
+	ctx := t.Context()
+	hash := "26xbg1ndr7hbcncrlf9nhx5is2b25d13"
+	narinfoKey := hash + ".narinfo"
+	narKey := "nar/" + hash + ".nar.zst"
+
+	createTestClosure(t, service, queries, hash)
+
+	// The closure expires; a non-force GC tombstones both objects but
+	// leaves them in S3 for the grace period.
+	_, err := service.Pool.Exec(ctx, "UPDATE closures SET updated_at = now() - interval '2 days' WHERE key = $1", narinfoKey)
+	ok(t, err)
+
+	if status := service.RunGCForTest(24*time.Hour, time.Hour, false); status.Error != "" {
+		t.Fatalf("GC failed: %s", status.Error)
+	}
+
+	for _, key := range []string{narinfoKey, narKey} {
+		if live, err := queries.ObjectIsLive(ctx, key); err != nil || live {
+			t.Fatalf("%s: live=%v err=%v after expiry, want a tombstoned row", key, live, err)
+		}
+	}
+
+	ok(t, queries.RegisterCompletedObject(ctx, pg.RegisterCompletedObjectParams{Key: narinfoKey, Refs: []string{narKey}}))
+	ok(t, queries.UpsertPulledClosure(ctx, pg.UpsertPulledClosureParams{Key: narinfoKey, PulledSig: pulledSig("upstream-1:sig")}))
+
+	if live, err := queries.ObjectIsLive(ctx, narKey); err != nil || live {
+		t.Fatalf("NAR live=%v err=%v after the narinfo was re-rooted, want still tombstoned", live, err)
+	}
+
+	_, err = service.Pool.Exec(ctx, "UPDATE objects SET first_deleted_at = first_deleted_at - interval '1 day' WHERE key = $1", narKey)
+	ok(t, err)
+
+	return narKey
+}
+
+func TestGCKeepsReachableTombstonedObjects(t *testing.T) {
+	t.Parallel()
+
+	service := createTestService(t)
+	defer service.Close()
+
+	ctx := t.Context()
+	queries := pg.New(service.Pool)
+	narKey := expireAndReroot(t, service, queries)
+
+	// The NAR is reachable again, so it must be kept, not deleted.
+	if status := service.RunGCForTest(24*time.Hour, time.Hour, false); status.Error != "" {
+		t.Fatalf("GC failed: %s", status.Error)
+	}
+
+	if live, err := queries.ObjectIsLive(ctx, narKey); err != nil || !live {
+		t.Errorf("NAR live=%v err=%v after GC, want live", live, err)
+	}
+
+	if _, err := service.MinioClient.StatObject(ctx, service.Bucket, narKey, minio.StatObjectOptions{}); err != nil {
+		t.Errorf("NAR was deleted from S3 although its narinfo roots it again: %v", err)
+	}
+}
+
+// An earlier GC can delete an object from S3 and fail before deleting its
+// row, as when S3's answer to the delete is lost. Such an object must not
+// come back as live when it becomes reachable again.
+func TestGCLeavesReachableObjectsGoneFromS3Tombstoned(t *testing.T) {
+	t.Parallel()
+
+	service := createTestService(t)
+	defer service.Close()
+
+	ctx := t.Context()
+	queries := pg.New(service.Pool)
+	narKey := expireAndReroot(t, service, queries)
+
+	ok(t, service.MinioClient.RemoveObject(ctx, service.Bucket, narKey, minio.RemoveObjectOptions{}))
+
+	if status := service.RunGCForTest(24*time.Hour, time.Hour, false); status.Error != "" {
+		t.Fatalf("GC failed: %s", status.Error)
+	}
+
+	if live, err := queries.ObjectIsLive(ctx, narKey); err != nil || live {
+		t.Errorf("NAR live=%v err=%v after GC, want no live row for an object S3 no longer has", live, err)
 	}
 }
 

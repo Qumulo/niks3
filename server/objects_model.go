@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 
 	"github.com/Mic92/niks3/server/pg"
 	"github.com/minio/minio-go/v7"
@@ -98,6 +99,42 @@ func (s *Service) sweepBatch(ctx context.Context, gracePeriod int32, afterKey st
 	return keys[len(keys)-1], s3Errs, nil
 }
 
+// resurrectReachableObjects clears the tombstones of objects that became
+// reachable again since they were marked, so the sweep keeps them. It runs
+// under the GC lock, so no S3 delete is in flight, but an earlier run may have
+// deleted an object and failed before deleting its row, as when S3's answer to
+// the delete was lost. Only objects S3 still holds come back; the sweep deletes
+// the rows of the rest.
+func (s *Service) resurrectReachableObjects(ctx context.Context) error {
+	queries := pg.New(s.Pool)
+
+	keys, err := queries.ListReachableTombstonedObjects(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to list reachable tombstoned objects: %w", err)
+	}
+
+	missing, err := s.checkS3ObjectsExist(ctx, keys)
+	if err != nil {
+		// They stay tombstoned, as they would without this step.
+		slog.Warn("Not keeping tombstoned objects that are reachable again", "count", len(keys), "error", err)
+
+		return nil
+	}
+
+	present := slices.DeleteFunc(keys, func(key string) bool { return missing[key] })
+
+	resurrected, err := queries.ResurrectObjects(ctx, present)
+	if err != nil {
+		return fmt.Errorf("failed to resurrect reachable objects: %w", err)
+	}
+
+	if resurrected > 0 {
+		slog.Info("Kept tombstoned objects that are reachable again", "count", resurrected)
+	}
+
+	return nil
+}
+
 // cleanupOrphanObjects marks unreachable objects and deletes them from S3.
 // When onProgress is non-nil it is called after every batch so callers can
 // expose live counters.
@@ -108,6 +145,10 @@ func (s *Service) cleanupOrphanObjects(ctx context.Context, gracePeriod int32, o
 		if onProgress != nil {
 			onProgress(*stats)
 		}
+	}
+
+	if err := s.resurrectReachableObjects(ctx); err != nil {
+		return stats, err
 	}
 
 	marked, err := pg.New(s.Pool).MarkStaleObjects(ctx)
