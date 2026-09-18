@@ -155,6 +155,42 @@
             "string",
             "null"
           ]
+        },
+        "trustedKeys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "pullThrough": {
+          "type": "object",
+          "properties": {
+            "upstreams": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "negativeTTL": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "concurrency": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "narinfoConcurrency": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false

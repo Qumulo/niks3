@@ -48,6 +48,17 @@ cacheURL: ""
 readProxy:
   enabled: false
   redirectTTL: null # e.g. 15m
+  # Keys one of which must have signed an upstream narinfo for it to be
+  # served and stored. The public keys of signing.keys are always trusted.
+  trustedKeys: [] # e.g. ["cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="]
+  # Fill misses from upstream caches (requires enabled). Upstream narinfos
+  # are stored verbatim, so clients keep the upstream key in
+  # trusted-public-keys.
+  pullThrough:
+    upstreams: [] # e.g. ["https://cache.nixos.org"]
+    negativeTTL: null # default 1m
+    concurrency: null # NAR fills, default 16; each may buffer a 16 MiB part
+    narinfoConcurrency: null # default 256
 maxNarSize: null # e.g. 4G
 cachePriority: null # e.g. 30
 debug: false
