@@ -117,7 +117,7 @@ func NewMetrics() *Metrics {
 		}),
 		pullThroughRequests: factory.NewCounterVec(prometheus.CounterOpts{
 			Name: "niks3_pull_through_requests_total",
-			Help: "Read proxy requests for narinfos and NARs by outcome (hit, miss, negative, passthrough, unverified, rejected, upstream_error, fill_failed).",
+			Help: "Read proxy requests for narinfos and NARs by outcome (hit, miss, range, negative, passthrough, unverified, rejected, upstream_error, fill_failed).",
 		}, []string{"kind", "result"}),
 		pullThroughUpstreamBytes: factory.NewCounter(prometheus.CounterOpts{
 			Name: "niks3_pull_through_upstream_bytes_total",
