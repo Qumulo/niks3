@@ -3,10 +3,12 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/Mic92/niks3/server/pg"
 	"github.com/Mic92/niks3/server/signing"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/klauspost/compress/zstd"
 	minio "github.com/minio/minio-go/v7"
@@ -35,8 +38,24 @@ const (
 	// upstream requests.
 	pullThroughMapCap = 100_000
 
+	// pullThroughPartSize is the multipart part size when the upstream does
+	// not announce a Content-Length. Bounds per-fill memory: minio would
+	// otherwise size parts for a 5 TiB object.
+	pullThroughPartSize = 16 << 20
+
+	// pullThroughCopyBuf is the chunk size when fanning an upstream body
+	// out to the client and S3.
+	pullThroughCopyBuf = 256 << 10
+
 	// pullThroughHeaderTimeout bounds the wait for upstream response headers.
 	pullThroughHeaderTimeout = 30 * time.Second
+
+	// pullThroughDBTimeout bounds bookkeeping writes detached from a request.
+	pullThroughDBTimeout = 10 * time.Second
+
+	// pullThroughDefaultConcurrency bounds simultaneous NAR fills. Each
+	// holds up to a multipart part in memory, so this is a memory knob.
+	pullThroughDefaultConcurrency = 16
 
 	// pullThroughDefaultNarinfoConcurrency bounds simultaneous narinfo
 	// fills, which are a few KiB each: the bound protects the upstream and
@@ -54,6 +73,8 @@ const (
 var (
 	errUpstreamNotFound = errors.New("not found upstream")
 	errBadNarinfo       = errors.New("unusable narinfo")
+	errFileHashMismatch = errors.New("pulled NAR does not match the FileHash in its narinfo")
+	errFillAbandoned    = errors.New("client disconnected and S3 fill failed")
 )
 
 // PullThroughConfig configures upstream fills for the read proxy.
@@ -66,21 +87,48 @@ type PullThroughConfig struct {
 	TrustedKeys []string
 	// NegativeTTL is how long an upstream 404 is remembered.
 	NegativeTTL time.Duration
+	// Concurrency bounds simultaneous NAR fills. 0 means the default.
+	Concurrency int
 	// NarinfoConcurrency bounds simultaneous narinfo fills. 0 means the default.
 	NarinfoConcurrency int
 }
 
+// narMeta is what a narinfo told us about its NAR, used to verify the NAR
+// when it is pulled and to size the fill. The in-memory map is a cache of
+// the pulled_nars table, which is what survives restarts and is shared
+// between replicas.
+type narMeta struct {
+	narinfoKey string
+	fileHash   string
+	fileSize   uint64
+	narSize    uint64
+}
+
+// narMetaFromNarinfo extracts what a narinfo says about its NAR. ok is false when
+// the narinfo carries no FileHash: such a NAR cannot be verified.
+func narMetaFromNarinfo(key string, info *narinfo) (narMeta, bool) {
+	if info.FileHash == "" {
+		return narMeta{}, false
+	}
+
+	return narMeta{narinfoKey: key, fileHash: info.FileHash, fileSize: info.FileSize, narSize: info.NarSize}, true
+}
+
 // PullThrough holds the upstream client and the in-memory bookkeeping for
-// fills: recent upstream 404s.
+// fills: which keys are being filled, recent upstream 404s and NAR
+// metadata learned from narinfos.
 type PullThrough struct {
 	upstreams   []*url.URL
 	trustedKeys []*signing.PublicKey
 	negativeTTL time.Duration
 	client      *http.Client
+	narSem      chan struct{}
 	narinfoSem  chan struct{}
 
 	mu       sync.Mutex
+	inflight map[string]struct{}
 	negative map[string]time.Time
+	narMeta  map[string]narMeta
 }
 
 // NewPullThrough validates cfg and builds the upstream client.
@@ -93,6 +141,11 @@ func NewPullThrough(cfg PullThroughConfig) (*PullThrough, error) {
 		return nil, errors.New("pull-through requires at least one trusted key")
 	}
 
+	concurrency := cfg.Concurrency
+	if concurrency <= 0 {
+		concurrency = pullThroughDefaultConcurrency
+	}
+
 	narinfoConcurrency := cfg.NarinfoConcurrency
 	if narinfoConcurrency <= 0 {
 		narinfoConcurrency = pullThroughDefaultNarinfoConcurrency
@@ -100,8 +153,11 @@ func NewPullThrough(cfg PullThroughConfig) (*PullThrough, error) {
 
 	p := &PullThrough{
 		negativeTTL: cfg.NegativeTTL,
+		narSem:      make(chan struct{}, concurrency),
 		narinfoSem:  make(chan struct{}, narinfoConcurrency),
+		inflight:    make(map[string]struct{}),
 		negative:    make(map[string]time.Time),
+		narMeta:     make(map[string]narMeta),
 	}
 
 	for _, raw := range cfg.Upstreams {
@@ -137,7 +193,7 @@ func NewPullThrough(cfg PullThroughConfig) (*PullThrough, error) {
 
 	transport = transport.Clone()
 	transport.ResponseHeaderTimeout = pullThroughHeaderTimeout
-	transport.MaxIdleConnsPerHost = narinfoConcurrency
+	transport.MaxIdleConnsPerHost = max(concurrency, narinfoConcurrency)
 
 	p.client = &http.Client{Transport: transport}
 
@@ -176,6 +232,28 @@ func acquire(ctx context.Context, sem chan struct{}) (func(), bool) {
 	}
 }
 
+// beginFill claims key for filling. False means another request is already
+// filling it; the caller should stream without persisting.
+func (p *PullThrough) beginFill(key string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if _, busy := p.inflight[key]; busy {
+		return false
+	}
+
+	p.inflight[key] = struct{}{}
+
+	return true
+}
+
+func (p *PullThrough) endFill(key string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	delete(p.inflight, key)
+}
+
 func (p *PullThrough) isNegative(key string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -209,6 +287,56 @@ func (p *PullThrough) setNegative(key string) {
 	p.negative[key] = time.Now().Add(p.negativeTTL)
 }
 
+func (p *PullThrough) setNarMeta(narKey string, meta narMeta) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if len(p.narMeta) >= pullThroughMapCap {
+		clear(p.narMeta)
+	}
+
+	p.narMeta[narKey] = meta
+}
+
+func (p *PullThrough) getNarMeta(narKey string) (narMeta, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	meta, ok := p.narMeta[narKey]
+
+	return meta, ok
+}
+
+// pulledNarMeta looks up what the narinfo for narKey said about it, from
+// memory first and then from the database, which is what survives a
+// restart, a narinfo served as a hit, or a fill on another replica.
+func (s *Service) pulledNarMeta(ctx context.Context, narKey string) (narMeta, bool) {
+	p := s.PullThrough
+
+	if meta, ok := p.getNarMeta(narKey); ok {
+		return meta, true
+	}
+
+	row, err := pg.New(s.Pool).GetPulledNar(ctx, narKey)
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			slog.Warn("Failed to look up pulled NAR metadata", "key", narKey, "error", err)
+		}
+
+		return narMeta{}, false
+	}
+
+	meta := narMeta{
+		narinfoKey: row.NarinfoKey,
+		fileHash:   row.FileHash,
+		fileSize:   uint64(max(row.FileSize, 0)),
+		narSize:    uint64(max(row.NarSize, 0)),
+	}
+	p.setNarMeta(narKey, meta)
+
+	return meta, true
+}
+
 // fetch tries each upstream in order. It returns errUpstreamNotFound when
 // every upstream answered 404, otherwise the last failure. The caller owns
 // resp.Body.
@@ -225,7 +353,7 @@ func (p *PullThrough) fetch(ctx context.Context, method, key string) (*http.Resp
 			return nil, fmt.Errorf("building upstream request: %w", err)
 		}
 
-		// Identity keeps Content-Length meaningful.
+		// Identity keeps Content-Length meaningful for NARs.
 		req.Header.Set("Accept-Encoding", "identity")
 		req.Header.Set("User-Agent", "niks3 pull-through")
 
@@ -321,17 +449,20 @@ func zstdCompress(data []byte) ([]byte, error) {
 
 // pullThroughMiss handles an S3 miss for a key pull-through can fill.
 // Returns false when pull-through is off, err is not a missing key, or the
-// key is not a narinfo, in which case the caller reports the error.
+// key is not a narinfo or NAR, in which case the caller reports the error.
 func (s *Service) pullThroughMiss(w http.ResponseWriter, r *http.Request, key string, err error) bool {
 	if s.PullThrough == nil || !isNoSuchKey(err) {
 		return false
 	}
 
-	if !narinfoRe.MatchString(key) {
+	switch {
+	case narinfoRe.MatchString(key):
+		s.pullThroughNarinfo(w, r, key)
+	case narRe.MatchString(key):
+		s.pullThroughNar(w, r, key)
+	default:
 		return false
 	}
-
-	s.pullThroughNarinfo(w, r, key)
 
 	return true
 }
@@ -375,6 +506,42 @@ func (s *Service) pullThroughReject(w http.ResponseWriter, kind, key, reason str
 	slog.Warn("Rejected upstream object", "key", key, "reason", reason)
 	http.Error(w, "Bad Gateway", http.StatusBadGateway)
 	s.Metrics.recordPullThrough(kind, "rejected")
+}
+
+// pullThroughHeadNar forwards a HEAD for a missing NAR upstream without
+// persisting anything. There is nothing to validate about a NAR without
+// its body, so the upstream's answer is passed on as is. It buffers
+// nothing either, so it takes a narinfo slot rather than one of the NAR
+// fill slots that size memory.
+func (s *Service) pullThroughHeadNar(w http.ResponseWriter, r *http.Request, key string) {
+	p := s.PullThrough
+
+	release, ok := acquire(r.Context(), p.narinfoSem)
+	if !ok {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+
+		return
+	}
+	defer release()
+
+	resp, err := p.fetch(r.Context(), http.MethodHead, key)
+	if err != nil {
+		s.pullThroughUpstreamError(w, r, kindNar, key, err)
+
+		return
+	}
+
+	closeBody(resp)
+
+	w.Header().Set("Content-Type", proxyContentType(key, ""))
+
+	if resp.ContentLength >= 0 {
+		w.Header().Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
+	}
+
+	w.Header().Set(cacheStatusHeader, "MISS")
+	w.WriteHeader(http.StatusOK)
+	s.Metrics.recordPullThrough(kindNar, "miss")
 }
 
 // pullThroughNarinfo fetches a narinfo upstream, validates it, stores it
@@ -435,7 +602,10 @@ type pulledNarinfo struct {
 // validateNarinfo checks a narinfo's bytes for key: syntax, the StorePath
 // against the requested hash, the URL against the NAR allowlist and the
 // signature against the trusted keys. The error is the reason a narinfo
-// is rejected, worded for the log.
+// is rejected, worded for the log. A narinfo that passes is remembered:
+// what it says about its NAR is kept in memory so the NAR can be
+// verified when it is pulled; registerPulled writes the same to the
+// database.
 func (p *PullThrough) validateNarinfo(key string, data []byte) (*pulledNarinfo, error) {
 	info, err := parseNarinfo(data)
 	if err != nil {
@@ -457,6 +627,10 @@ func (p *PullThrough) validateNarinfo(key string, data []byte) (*pulledNarinfo, 
 
 	if sig == "" {
 		return nil, errors.New("no valid signature from a trusted key")
+	}
+
+	if meta, ok := narMetaFromNarinfo(key, info); ok {
+		p.setNarMeta(info.URL, meta)
 	}
 
 	return &pulledNarinfo{data: data, info: info, sig: sig}, nil
@@ -536,19 +710,22 @@ func (s *Service) persistNarinfo(ctx context.Context, key string, pulled *pulled
 
 	s.S3RateLimiter.RecordSuccess()
 
-	if err := s.registerPulled(ctx, key, info.refKeys(), uint64(len(plain)), pulled.sig); err != nil {
+	size := uint64(len(plain))
+	if err := s.registerPulled(ctx, key, info.refKeys(), &size, info, pulled.sig); err != nil {
 		slog.Error("Failed to register pulled narinfo", "key", key, "error", err)
 	}
 }
 
-// registerPulled records a filled narinfo in one transaction: rooted by a
-// pulled closure that records sig, the trusted signature the narinfo was
-// verified with, and tracked as an object with its references.
+// registerPulled records a filled object in one transaction. For a narinfo
+// (info != nil) it also roots the object with a pulled closure that records
+// sig, the trusted signature the narinfo was verified with, and remembers
+// what the narinfo said about its NAR, so the NAR can be verified when it
+// is pulled later.
 //
-// Lock order is closures, then objects: the same order
+// Lock order is closures, then objects, then pulled_nars: the same order
 // commit_pending_closure takes for a native upload of the same key, so
 // the two cannot deadlock when they race. Keep it that way.
-func (s *Service) registerPulled(ctx context.Context, key string, refs []string, size uint64, sig string) error {
+func (s *Service) registerPulled(ctx context.Context, key string, refs []string, size *uint64, info *narinfo, sig string) error {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin: %w", err)
@@ -560,24 +737,404 @@ func (s *Service) registerPulled(ctx context.Context, key string, refs []string,
 
 	queries := pg.New(tx)
 
-	if err := queries.UpsertPulledClosure(ctx, pg.UpsertPulledClosureParams{
-		Key:       key,
-		PulledSig: pgtype.Text{String: sig, Valid: true},
-	}); err != nil {
-		return fmt.Errorf("upsert pulled closure: %w", err)
+	if info != nil {
+		if err := queries.UpsertPulledClosure(ctx, pg.UpsertPulledClosureParams{
+			Key:       key,
+			PulledSig: pgtype.Text{String: sig, Valid: true},
+		}); err != nil {
+			return fmt.Errorf("upsert pulled closure: %w", err)
+		}
+	}
+
+	if refs == nil {
+		refs = []string{}
 	}
 
 	if err := queries.RegisterCompletedObject(ctx, pg.RegisterCompletedObjectParams{
 		Key:  key,
 		Refs: refs,
-		Size: optionalSize(&size),
+		Size: optionalSize(size),
 	}); err != nil {
 		return fmt.Errorf("register object: %w", err)
+	}
+
+	if info != nil {
+		if meta, ok := narMetaFromNarinfo(key, info); ok {
+			if err := queries.UpsertPulledNar(ctx, pg.UpsertPulledNarParams{
+				Key:        info.URL,
+				NarinfoKey: key,
+				FileHash:   meta.fileHash,
+				FileSize:   int64(min(meta.fileSize, math.MaxInt64)),
+				NarSize:    int64(min(meta.narSize, math.MaxInt64)),
+			}); err != nil {
+				return fmt.Errorf("upsert pulled nar: %w", err)
+			}
+		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit: %w", err)
 	}
+
+	return nil
+}
+
+// pullThroughNar streams a NAR from upstream to the client while filling
+// S3. The fill is detached from the request so a client that disconnects
+// mid-download still leaves the object behind for the next reader. A NAR
+// whose narinfo we have not seen (or that carried no FileHash) cannot be
+// verified, so it is streamed but not stored. A narinfo miss records what
+// to check its NAR against; a narinfo hit does not, so this repeats on
+// every read of a NAR under a narinfo niks3 never pulled (uploaded
+// natively, or written by another tool) until that narinfo is pulled
+// again, and is logged so the operator can tell.
+func (s *Service) pullThroughNar(w http.ResponseWriter, r *http.Request, key string) {
+	p := s.PullThrough
+
+	if p.isNegative(key) {
+		s.pullThroughNotFound(w, r, kindNar, "negative")
+
+		return
+	}
+
+	if r.Method == http.MethodHead {
+		s.pullThroughHeadNar(w, r, key)
+
+		return
+	}
+
+	release, ok := acquire(r.Context(), p.narSem)
+	if !ok {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+
+		return
+	}
+	defer release()
+
+	s.Metrics.pullThroughInFlightAdd(1)
+	defer s.Metrics.pullThroughInFlightAdd(-1)
+
+	ctx, cancel := context.WithCancel(context.WithoutCancel(r.Context()))
+	defer cancel()
+
+	resp, err := p.fetch(ctx, http.MethodGet, key)
+	if err != nil {
+		s.pullThroughUpstreamError(w, r, kindNar, key, err)
+
+		return
+	}
+	defer closeBody(resp)
+
+	meta, haveMeta := s.pulledNarMeta(r.Context(), key)
+
+	size := resp.ContentLength
+	if size < 0 && haveMeta && meta.fileSize > 0 && meta.fileSize <= math.MaxInt64 {
+		size = int64(meta.fileSize)
+	}
+
+	if haveMeta && meta.fileSize > 0 && size >= 0 && uint64(size) != meta.fileSize {
+		s.pullThroughReject(w, kindNar, key, fmt.Sprintf("upstream size %d differs from narinfo FileSize %d", size, meta.fileSize))
+
+		return
+	}
+
+	// Bound the whole transfer by size, as the S3 streaming path does.
+	budget := ProxyWriteTimeout(size)
+	timer := time.AfterFunc(budget, cancel)
+
+	defer timer.Stop()
+
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(budget)); err != nil {
+		slog.Debug("Failed to extend write deadline", "key", key, "error", err)
+	}
+
+	w.Header().Set("Content-Type", proxyContentType(key, ""))
+	w.Header().Set(cacheStatusHeader, "MISS")
+
+	if size >= 0 {
+		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+	}
+
+	w.WriteHeader(http.StatusOK)
+
+	if !haveMeta {
+		slog.Warn("Streaming NAR without its narinfo's FileHash; not stored", "key", key)
+
+		n, _ := io.Copy(w, resp.Body)
+		s.Metrics.addPullThroughBytes(n)
+		s.Metrics.recordPullThrough(kindNar, "unverified")
+
+		return
+	}
+
+	if !p.beginFill(key) {
+		// Another request is filling this key; stream without persisting.
+		n, _ := io.Copy(w, resp.Body)
+		s.Metrics.addPullThroughBytes(n)
+		s.Metrics.recordPullThrough(kindNar, "passthrough")
+
+		return
+	}
+	defer p.endFill(key)
+
+	s.fillNar(ctx, cancel, w, r, key, resp.Body, size, meta)
+}
+
+// fillNar fans body out to the client and to an S3 upload. The S3 side is
+// primary: the client is dropped on its first write error, while an S3
+// failure only stops the fill. The NAR is hashed inline and the S3 side
+// lags the client by one chunk, so the last chunk is only released once
+// the whole body has been read and verified against the size and the
+// FileHash its narinfo announced. A NAR that fails verification is cut
+// short so it does not become a complete upload, and is deleted again in
+// the cases where S3 committed it anyway; the client still gets every
+// byte and Nix rejects it by NarHash on its side.
+func (s *Service) fillNar(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	w http.ResponseWriter,
+	r *http.Request,
+	key string,
+	body io.Reader,
+	size int64,
+	meta narMeta,
+) {
+	pr, pw := io.Pipe()
+	putDone := make(chan error, 1)
+
+	go func() {
+		err := s.putNar(ctx, key, pr, size)
+		// Close the read side whatever happened. On an error further
+		// pw.Write calls fail with err instead of blocking; after a
+		// successful completion (the body ran past the announced size,
+		// which minio stops reading at) they fail with ErrClosedPipe
+		// instead of hanging forever on a reader that is gone.
+		_ = pr.CloseWithError(err)
+
+		putDone <- err
+	}()
+
+	hasher := sha256.New()
+	fan := &fanOut{s3: pw, client: w, clientCtx: r.Context(), clientLeft: size, hasher: hasher}
+	buf := make([]byte, pullThroughCopyBuf)
+
+	var readErr error
+
+	for {
+		n, err := body.Read(buf)
+		if n > 0 && !fan.write(buf[:n]) {
+			readErr = errFillAbandoned
+
+			break
+		}
+
+		if errors.Is(err, io.EOF) {
+			break
+		}
+
+		if err != nil {
+			readErr = err
+
+			break
+		}
+	}
+
+	s.Metrics.addPullThroughBytes(fan.total)
+
+	var verifyErr error
+	if readErr == nil {
+		verifyErr = verifyPulledNar(fan.total, size, hasher.Sum(nil), meta)
+	}
+
+	switch {
+	case readErr != nil:
+		_ = pw.CloseWithError(fmt.Errorf("upstream read: %w", readErr))
+
+		cancel()
+	case verifyErr != nil:
+		// The held-back tail never reaches S3: the upload ends short of
+		// its Content-Length (or its last part) and fails instead of
+		// committing a NAR we cannot vouch for.
+		_ = pw.CloseWithError(verifyErr)
+	default:
+		fan.flush()
+
+		_ = pw.Close()
+	}
+
+	putErr := <-putDone
+
+	switch {
+	case readErr == nil && verifyErr == nil && putErr == nil:
+		var narSize *uint64
+		if meta.narSize > 0 {
+			narSize = &meta.narSize
+		}
+
+		dbCtx, dbCancel := context.WithTimeout(context.WithoutCancel(ctx), pullThroughDBTimeout)
+		defer dbCancel()
+
+		if err := s.registerPulled(dbCtx, key, nil, narSize, nil, ""); err != nil {
+			slog.Error("Failed to register pulled NAR", "key", key, "error", err)
+		}
+
+		s.Metrics.recordPullThrough(kindNar, "miss")
+
+		return
+	case verifyErr != nil:
+		slog.Error("Discarded pulled NAR", "key", key, "error", verifyErr)
+		s.Metrics.recordPullThrough(kindNar, "rejected")
+	default:
+		slog.Warn("Failed to store pulled NAR", "key", key, "bytes", fan.total, "error", errors.Join(readErr, putErr))
+		s.Metrics.recordPullThrough(kindNar, "fill_failed")
+	}
+
+	if putErr == nil || verifyErr != nil {
+		// An object we will not vouch for may be sitting in the bucket
+		// untracked. It certainly is when minio completed before the fill
+		// was cut short (it stops reading at the announced size). It may
+		// be when the body ran past a size we announced to S3 over HTTPS:
+		// the transport sends exactly that many bytes, S3 commits, and
+		// only then does the transport notice the surplus and report the
+		// upload as failed. Deleting a key that is not there is one
+		// request and no error, so on any rejection take it back out.
+		s.removePulledNar(ctx, key)
+	}
+}
+
+// verifyPulledNar checks a fully read NAR against what we knew about it
+// up front: the size it was announced with and the FileHash its narinfo
+// carried.
+func verifyPulledNar(total, size int64, digest []byte, meta narMeta) error {
+	if size >= 0 && total != size {
+		return fmt.Errorf("upstream sent %d bytes, expected %d", total, size)
+	}
+
+	if !hashMatches(meta.fileHash, digest) {
+		return errFileHashMismatch
+	}
+
+	return nil
+}
+
+// removePulledNar deletes an object the fill left behind but could not
+// verify. Failure leaves an untracked object in the bucket, which is
+// logged loudly: nothing else will ever collect it. The delete is by key
+// alone: were a native upload or another replica's fill to commit a good
+// object at this key in the same moment, it would go too, and its live
+// row would then point at nothing. That takes a bad upstream body for a
+// key something else is writing at that instant, which is accepted.
+func (s *Service) removePulledNar(ctx context.Context, key string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pullThroughDBTimeout)
+	defer cancel()
+
+	if err := s.S3RateLimiter.Wait(ctx); err != nil {
+		slog.Error("Unverified pulled NAR left in S3 untracked", "key", key, "error", err)
+
+		return
+	}
+
+	if err := s.MinioClient.RemoveObject(ctx, s.Bucket, key, minio.RemoveObjectOptions{}); err != nil {
+		if isRateLimitError(err) {
+			s.S3RateLimiter.RecordThrottle()
+		}
+
+		slog.Error("Unverified pulled NAR left in S3 untracked", "key", key, "error", err)
+
+		return
+	}
+
+	s.S3RateLimiter.RecordSuccess()
+}
+
+// fanOut writes each chunk to the client and, one chunk late, to the S3
+// pipe, dropping either side on its first failure, and hashes everything
+// it sees. The lag lets the caller verify the whole body before the last
+// chunk is released to S3.
+type fanOut struct {
+	s3        io.Writer
+	client    io.Writer
+	clientCtx context.Context //nolint:containedctx // request context, checked per chunk
+	// clientLeft is how many more bytes the client's Content-Length
+	// allows, or negative when no length was announced. An upstream body
+	// that runs long is still read and hashed in full, so the fill can
+	// reject it, but the client gets a well-formed response.
+	clientLeft int64
+	hasher     io.Writer
+	hold       []byte // the chunk S3 has not been given yet
+	total      int64
+	s3Down     bool
+	clientOff  bool
+}
+
+// write returns false once neither side can take more data.
+func (f *fanOut) write(chunk []byte) bool {
+	f.total += int64(len(chunk))
+	_, _ = f.hasher.Write(chunk)
+
+	if !f.s3Down {
+		f.releaseHeld()
+		f.hold = append(f.hold[:0], chunk...)
+	}
+
+	if !f.clientOff && f.clientCtx.Err() != nil {
+		f.clientOff = true
+	}
+
+	if !f.clientOff {
+		out := chunk
+		if f.clientLeft >= 0 && int64(len(out)) > f.clientLeft {
+			out = out[:f.clientLeft]
+		}
+
+		if _, err := f.client.Write(out); err != nil {
+			f.clientOff = true
+		} else if f.clientLeft >= 0 {
+			f.clientLeft -= int64(len(out))
+		}
+	}
+
+	return !f.s3Down || !f.clientOff
+}
+
+// flush releases the held-back chunk to S3 once the body is verified.
+func (f *fanOut) flush() {
+	if !f.s3Down {
+		f.releaseHeld()
+	}
+
+	f.hold = f.hold[:0]
+}
+
+func (f *fanOut) releaseHeld() {
+	if len(f.hold) == 0 {
+		return
+	}
+
+	if _, err := f.s3.Write(f.hold); err != nil {
+		f.s3Down = true
+	}
+}
+
+func (s *Service) putNar(ctx context.Context, key string, body io.Reader, size int64) error {
+	if err := s.S3RateLimiter.Wait(ctx); err != nil {
+		return fmt.Errorf("rate limiter: %w", err)
+	}
+
+	opts := minio.PutObjectOptions{ContentType: proxyContentType(key, "")}
+	if size < 0 {
+		opts.PartSize = pullThroughPartSize
+	}
+
+	if _, err := s.MinioClient.PutObject(ctx, s.Bucket, key, body, size, opts); err != nil {
+		if isRateLimitError(err) {
+			s.S3RateLimiter.RecordThrottle()
+		}
+
+		return fmt.Errorf("put object: %w", err)
+	}
+
+	s.S3RateLimiter.RecordSuccess()
 
 	return nil
 }
