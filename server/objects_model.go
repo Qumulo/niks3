@@ -47,6 +47,19 @@ func (s *Service) getObjectsForDeletion(ctx context.Context,
 
 	queries := pg.New(s.Pool)
 
+	// Keep what became reachable again since it was marked; see the query.
+	resurrected, err := queries.ResurrectReachableObjects(ctx)
+	if err != nil {
+		*queryErr = fmt.Errorf("failed to resurrect reachable objects: %w", err)
+		slog.Error("failed to resurrect reachable objects", "error", err)
+
+		return
+	}
+
+	if resurrected > 0 {
+		slog.Info("Kept tombstoned objects that are reachable again", "count", resurrected)
+	}
+
 	// First, mark stale objects and get count
 	marked, err := queries.MarkStaleObjects(ctx)
 	if err != nil {
