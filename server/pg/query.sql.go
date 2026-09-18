@@ -80,13 +80,30 @@ func (q *Queries) CountPendingClosures(ctx context.Context) (int64, error) {
 	return count, err
 }
 
+const countPinnedPulledClosuresNotSignedBy = `-- name: CountPinnedPulledClosuresNotSignedBy :one
+SELECT count(*) FROM closures
+WHERE closures.pulled_sig IS NOT NULL
+  AND split_part(closures.pulled_sig, ':', 1) <> ALL($1::text [])
+  AND closures.key IN (SELECT narinfo_key FROM pins)
+`
+
+// The pinned closures DeletePulledClosuresNotSignedBy would otherwise have
+// expired, so the operator can be told a pin is holding one.
+func (q *Queries) CountPinnedPulledClosuresNotSignedBy(ctx context.Context, dollar_1 []string) (int64, error) {
+	row := q.db.QueryRow(ctx, countPinnedPulledClosuresNotSignedBy, dollar_1)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const deleteClosures = `-- name: DeleteClosures :execrows
 DELETE FROM closures
 WHERE closures.updated_at < $1
   AND closures.key NOT IN (SELECT narinfo_key FROM pins)
 `
 
-// Delete old closures, but exclude any that are pinned
+// Delete old closures, uploaded or pulled alike, but exclude any that are
+// pinned.
 func (q *Queries) DeleteClosures(ctx context.Context, updatedAt pgtype.Timestamp) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteClosures, updatedAt)
 	if err != nil {
@@ -120,6 +137,23 @@ func (q *Queries) DeleteObjects(ctx context.Context, dollar_1 []string) error {
 	return err
 }
 
+const deleteOrphanedPulledNars = `-- name: DeleteOrphanedPulledNars :execrows
+DELETE FROM pulled_nars
+WHERE NOT EXISTS (
+    SELECT 1 FROM objects
+    WHERE objects.key = pulled_nars.narinfo_key
+)
+`
+
+// Drop NAR metadata whose narinfo is no longer tracked at all.
+func (q *Queries) DeleteOrphanedPulledNars(ctx context.Context) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteOrphanedPulledNars)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const deletePin = `-- name: DeletePin :exec
 DELETE FROM pins
 WHERE name = $1
@@ -128,6 +162,26 @@ WHERE name = $1
 func (q *Queries) DeletePin(ctx context.Context, name string) error {
 	_, err := q.db.Exec(ctx, deletePin, name)
 	return err
+}
+
+const deletePulledClosuresNotSignedBy = `-- name: DeletePulledClosuresNotSignedBy :execrows
+DELETE FROM closures
+WHERE closures.pulled_sig IS NOT NULL
+  AND split_part(closures.pulled_sig, ':', 1) <> ALL($1::text [])
+  AND closures.key NOT IN (SELECT narinfo_key FROM pins)
+`
+
+// Expire pull-through closures whose narinfo was verified by a key since
+// dropped from the trusted set. Keys are matched by name, which is how Nix
+// identifies them too: rotating a key means a new name (cache.nixos.org-1,
+// -2), and a replacement key that reuses a name keeps what the old one
+// vouched for. Pinned closures are kept, as under the other expiries.
+func (q *Queries) DeletePulledClosuresNotSignedBy(ctx context.Context, dollar_1 []string) (int64, error) {
+	result, err := q.db.Exec(ctx, deletePulledClosuresNotSignedBy, dollar_1)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const getClosure = `-- name: GetClosure :one
@@ -446,6 +500,30 @@ func (q *Queries) GetPresentObjects(ctx context.Context, dollar_1 []string) ([]s
 	return items, nil
 }
 
+const getPulledNar = `-- name: GetPulledNar :one
+SELECT narinfo_key, file_hash, file_size, nar_size FROM pulled_nars
+WHERE key = $1
+`
+
+type GetPulledNarRow struct {
+	NarinfoKey string `json:"narinfo_key"`
+	FileHash   string `json:"file_hash"`
+	FileSize   int64  `json:"file_size"`
+	NarSize    int64  `json:"nar_size"`
+}
+
+func (q *Queries) GetPulledNar(ctx context.Context, key string) (GetPulledNarRow, error) {
+	row := q.db.QueryRow(ctx, getPulledNar, key)
+	var i GetPulledNarRow
+	err := row.Scan(
+		&i.NarinfoKey,
+		&i.FileHash,
+		&i.FileSize,
+		&i.NarSize,
+	)
+	return i, err
+}
+
 const getRedundantMultipartUploads = `-- name: GetRedundantMultipartUploads :many
 SELECT upload_id
 FROM multipart_uploads
@@ -632,6 +710,38 @@ func (q *Queries) MarkStaleObjects(ctx context.Context) (int64, error) {
 	return result.RowsAffected(), nil
 }
 
+const objectIsLive = `-- name: ObjectIsLive :one
+SELECT EXISTS (
+    SELECT 1 FROM objects
+    WHERE key = $1 AND deleted_at IS NULL
+)::boolean AS live
+`
+
+// Whether the object is tracked and not tombstoned. The read proxy uses
+// this instead of an S3 HEAD before redirecting NAR reads.
+func (q *Queries) ObjectIsLive(ctx context.Context, key string) (bool, error) {
+	row := q.db.QueryRow(ctx, objectIsLive, key)
+	var live bool
+	err := row.Scan(&live)
+	return live, err
+}
+
+const objectIsTracked = `-- name: ObjectIsTracked :one
+SELECT EXISTS (
+    SELECT 1 FROM objects
+    WHERE key = $1
+)::boolean AS tracked
+`
+
+// Whether the object has a row at all, tombstoned or not. The hit path
+// adopts a tagged pull-through object that has none.
+func (q *Queries) ObjectIsTracked(ctx context.Context, key string) (bool, error) {
+	row := q.db.QueryRow(ctx, objectIsTracked, key)
+	var tracked bool
+	err := row.Scan(&tracked)
+	return tracked, err
+}
+
 const registerCompletedObject = `-- name: RegisterCompletedObject :exec
 INSERT INTO objects (key, refs, size)
 VALUES ($1, $2::varchar [], $3)
@@ -722,5 +832,55 @@ type UpsertPinParams struct {
 // Create or update a pin. Updates the narinfo_key, store_path, and updated_at if the pin already exists.
 func (q *Queries) UpsertPin(ctx context.Context, arg UpsertPinParams) error {
 	_, err := q.db.Exec(ctx, upsertPin, arg.Name, arg.NarinfoKey, arg.StorePath)
+	return err
+}
+
+const upsertPulledClosure = `-- name: UpsertPulledClosure :exec
+INSERT INTO closures (key, updated_at, pulled_sig)
+VALUES ($1, timezone('UTC', now()), $2)
+ON CONFLICT (key) DO UPDATE SET updated_at = timezone('UTC', now()), pulled_sig = excluded.pulled_sig
+WHERE closures.pulled_sig IS NOT NULL
+`
+
+type UpsertPulledClosureParams struct {
+	Key       string      `json:"key"`
+	PulledSig pgtype.Text `json:"pulled_sig"`
+}
+
+// Root a pulled narinfo, recording the signature it was verified with. A
+// re-fill records the latest verification. An existing upload closure for
+// the same key is left untouched: it already keeps the object alive.
+func (q *Queries) UpsertPulledClosure(ctx context.Context, arg UpsertPulledClosureParams) error {
+	_, err := q.db.Exec(ctx, upsertPulledClosure, arg.Key, arg.PulledSig)
+	return err
+}
+
+const upsertPulledNar = `-- name: UpsertPulledNar :exec
+INSERT INTO pulled_nars (key, narinfo_key, file_hash, file_size, nar_size)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (key) DO UPDATE SET
+    narinfo_key = excluded.narinfo_key,
+    file_hash = excluded.file_hash,
+    file_size = excluded.file_size,
+    nar_size = excluded.nar_size
+`
+
+type UpsertPulledNarParams struct {
+	Key        string `json:"key"`
+	NarinfoKey string `json:"narinfo_key"`
+	FileHash   string `json:"file_hash"`
+	FileSize   int64  `json:"file_size"`
+	NarSize    int64  `json:"nar_size"`
+}
+
+// Remember what a pulled narinfo said about its NAR.
+func (q *Queries) UpsertPulledNar(ctx context.Context, arg UpsertPulledNarParams) error {
+	_, err := q.db.Exec(ctx, upsertPulledNar,
+		arg.Key,
+		arg.NarinfoKey,
+		arg.FileHash,
+		arg.FileSize,
+		arg.NarSize,
+	)
 	return err
 }
