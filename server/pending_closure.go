@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,7 +31,7 @@ func optionalSize(size *uint64) pgtype.Int8 {
 		return pgtype.Int8{}
 	}
 
-	return pgtype.Int8{Int64: int64(*size), Valid: true}
+	return pgtype.Int8{Int64: int64(min(*size, math.MaxInt64)), Valid: true}
 }
 
 type PendingObject struct {
@@ -83,7 +84,7 @@ func (s *Service) checkS3ObjectsExist(ctx context.Context, objectKeys []string) 
 	for _, key := range objectKeys {
 		g.Go(func() error {
 			if err := s.S3RateLimiter.Wait(ctx); err != nil {
-				return err
+				return fmt.Errorf("rate limiter: %w", err)
 			}
 
 			_, err := s.MinioClient.StatObject(ctx, s.Bucket, key, minio.StatObjectOptions{})
@@ -112,7 +113,7 @@ func (s *Service) checkS3ObjectsExist(ctx context.Context, objectKeys []string) 
 	}
 
 	if err := g.Wait(); err != nil {
-		return missingObjects, err
+		return missingObjects, fmt.Errorf("stat objects: %w", err)
 	}
 
 	for key := range missingObjects {
@@ -293,7 +294,7 @@ func (s *Service) createPendingObjects(
 	for _, pendingObject := range pendingObjectsParams {
 		obj := objectsMap[pendingObject.Key]
 
-		if obj.Type == "nar" {
+		if obj.Type == objectTypeNar {
 			var narSize uint64
 			if obj.NarSize != nil {
 				narSize = *obj.NarSize
@@ -332,7 +333,7 @@ func (s *Service) createPendingObjects(
 				return fmt.Errorf("failed to create multipart upload %q: %w", task.key, err)
 			}
 
-			po.Type = "nar"
+			po.Type = objectTypeNar
 
 			mu.Lock()
 			result[task.key] = po
@@ -342,12 +343,16 @@ func (s *Service) createPendingObjects(
 		})
 	}
 
-	return g.Wait()
+	if err := g.Wait(); err != nil {
+		return fmt.Errorf("presign objects: %w", err)
+	}
+
+	return nil
 }
 
 func (s *Service) makePresignedURL(ctx context.Context, objectKey string, objectType string) (PendingObject, error) {
 	if err := s.S3RateLimiter.Wait(ctx); err != nil {
-		return PendingObject{}, err
+		return PendingObject{}, fmt.Errorf("rate limiter: %w", err)
 	}
 
 	presignedURL, err := s.PresignClient.PresignedPutObject(ctx,

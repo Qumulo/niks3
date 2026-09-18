@@ -156,21 +156,26 @@ func (s *Service) CleanupClosuresOlder(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
 
-		_ = json.NewEncoder(w).Encode(api.GCConflictResponse{
+		if err := json.NewEncoder(w).Encode(api.GCConflictResponse{
 			Error:      "a different garbage collection is already running",
 			ActiveTask: result.Status,
-		})
+		}); err != nil {
+			slog.Debug("Failed to write GC conflict", "error", err)
+		}
 
 		return
 	}
 
 	if result.IsNew {
-		go s.runGarbageCollection(result.Task, age, pendingAge, force)
+		go s.runGarbageCollection(result.Task, age, pendingAge, force) //nolint:contextcheck // GC outlives the request
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
-	_ = json.NewEncoder(w).Encode(result.Status)
+
+	if err := json.NewEncoder(w).Encode(result.Status); err != nil {
+		slog.Debug("Failed to write GC status", "error", err)
+	}
 }
 
 // runGarbageCollection executes the full GC sequence in a background goroutine,
@@ -282,7 +287,7 @@ func (s *Service) runGarbageCollection(task *gcTask, age, pendingAge time.Durati
 }
 
 // GCStatusHandler handles GET /api/gc/status.
-func (s *Service) GCStatusHandler(w http.ResponseWriter, r *http.Request) {
+func (s *Service) GCStatusHandler(w http.ResponseWriter, _ *http.Request) {
 	status, ok := s.GCTasks.Get()
 	if !ok {
 		http.Error(w, "no garbage collection has run yet", http.StatusNotFound)
@@ -291,7 +296,10 @@ func (s *Service) GCStatusHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(status)
+
+	if err := json.NewEncoder(w).Encode(status); err != nil {
+		slog.Debug("Failed to write GC status", "error", err)
+	}
 }
 
 // vacuumGCTables runs VACUUM ANALYZE on all tables modified during garbage collection.

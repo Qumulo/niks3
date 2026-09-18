@@ -143,7 +143,7 @@ func (s *Service) removeS3Objects(ctx context.Context,
 	var s3Errors, batchErrors []error
 
 	for result := range s.MinioClient.RemoveObjectsWithResult(ctx, s.Bucket, objectCh, opts) {
-		if result.Err != nil {
+		if result.Err != nil { //nolint:nestif // the outcomes of one failed delete
 			// Track rate limit errors to enable adaptive rate limiting
 			if isRateLimitError(result.Err) {
 				s.S3RateLimiter.RecordThrottle()

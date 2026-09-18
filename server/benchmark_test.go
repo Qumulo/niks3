@@ -50,8 +50,7 @@ func benchmarkUploadClosure(ctx context.Context, b *testing.B, projectRoot, flak
 
 	output, err := cmd.Output()
 	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
+		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
 			b.Fatalf("Failed to build %s: %v\nStderr: %s", flakeAttr, err, exitErr.Stderr)
 		}
 
@@ -73,7 +72,7 @@ func benchmarkUploadClosure(ctx context.Context, b *testing.B, projectRoot, flak
 	for b.Loop() {
 		// Start fresh services for each iteration (don't count setup time)
 		b.StopTimer()
-		testService := createTestServiceWithAuth(b, testAuthToken)
+		testService := createTestServiceWithAuth(b, testAuthToken) //nolint:contextcheck // the service owns its context
 
 		// Initialize the bucket with nix-cache-info
 		err := testService.InitializeBucket(ctx)

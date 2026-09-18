@@ -2,6 +2,10 @@ package server
 
 import "strings"
 
+// objectTypeNar is the declared type of a NAR in the upload API; the other
+// types (narinfo, listing, build_log, realisation) appear once each.
+const objectTypeNar = "nar"
+
 // IsValidUploadKey reports whether a client may request a presigned upload
 // for the given object key and declared type.
 //
@@ -24,7 +28,7 @@ func IsValidUploadKey(key, objType string) bool {
 	switch objType {
 	case "narinfo":
 		return narinfoRe.MatchString(key)
-	case "nar":
+	case objectTypeNar:
 		return narRe.MatchString(key)
 	case "listing":
 		return lsRe.MatchString(key)

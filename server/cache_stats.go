@@ -24,8 +24,10 @@ func (s *Service) CacheStatsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	_ = json.NewEncoder(w).Encode(api.CacheStats{
+	if err := json.NewEncoder(w).Encode(api.CacheStats{
 		Objects:      stats.ObjectCount,
 		LogicalBytes: stats.TotalBytes,
-	})
+	}); err != nil {
+		slog.Debug("Failed to write cache stats", "error", err)
+	}
 }

@@ -35,8 +35,7 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request, limit int64, dst any
 	r.Body = http.MaxBytesReader(w, r.Body, limit)
 
 	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
-		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
+		if maxErr, ok := errors.AsType[*http.MaxBytesError](err); ok {
 			http.Error(w, fmt.Sprintf("request body exceeds %d bytes", maxErr.Limit), http.StatusRequestEntityTooLarge)
 
 			return false
@@ -183,7 +182,7 @@ func (s *Service) getValidMultipartUpload(w http.ResponseWriter, r *http.Request
 	}
 
 	// Multipart uploads are only ever created for NAR objects.
-	if !IsValidUploadKey(objectKey, "nar") {
+	if !IsValidUploadKey(objectKey, objectTypeNar) {
 		http.Error(w, fmt.Sprintf("invalid object key %q", objectKey), http.StatusBadRequest)
 
 		return pg.MultipartUpload{}, false
