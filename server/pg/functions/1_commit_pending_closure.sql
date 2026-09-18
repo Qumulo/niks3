@@ -12,7 +12,9 @@ BEGIN
     INSERT INTO closures (updated_at, key)
     SELECT now, key FROM pending_closures WHERE id = closure_id
     ON CONFLICT (key)
-    DO UPDATE SET updated_at = now
+    -- A native upload of a path the read proxy pulled earlier takes over
+    -- the root: it is no longer subject to the trusted-key expiry.
+    DO UPDATE SET updated_at = now, pulled_sig = NULL
     RETURNING (xmax = 0) AS is_inserted, key AS closure_key
     INTO is_inserted, closure_key;
 
