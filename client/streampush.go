@@ -14,8 +14,9 @@ import (
 
 const (
 	DefaultStreamBatchSize = 50
-	// Each push has its own NAR upload pool; a few in parallel keep
-	// closure setup of the next batch off the critical path.
+	// DefaultStreamParallel bounds pushes in flight. Each has its own NAR
+	// upload pool; a few in parallel keep closure setup of the next batch
+	// off the critical path.
 	DefaultStreamParallel = 4
 	// Single-path retries of a failed batch before the server is blamed.
 	streamIsolationProbes = 3

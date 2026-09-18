@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -113,21 +114,11 @@ func NewMetrics() *Metrics {
 	}
 }
 
-// recordGC records the outcome of a garbage collection run.
-func (m *Metrics) recordGC(result string, duration time.Duration, stats api.GCStats) {
-	m.gcRuns.WithLabelValues(result).Inc()
-	m.gcDuration.Observe(duration.Seconds())
-	m.gcObjectsDeleted.Add(float64(stats.ObjectsDeletedAfterGracePeriod))
-
-	if result == "succeeded" {
-		m.gcLastRun.SetToCurrentTime()
-	}
-}
-
 // statusRecorder captures the response status for instrumentation. Unwrap lets
 // http.ResponseController reach the underlying writer (e.g. for flushing).
 type statusRecorder struct {
 	http.ResponseWriter
+
 	status int
 }
 
@@ -171,6 +162,17 @@ func (m *Metrics) recordSkippedUploads(paths, narBytes uint64) {
 	m.skippedNarBytes.Add(float64(narBytes))
 }
 
+// recordGC records the outcome of a garbage collection run.
+func (m *Metrics) recordGC(result string, duration time.Duration, stats api.GCStats) {
+	m.gcRuns.WithLabelValues(result).Inc()
+	m.gcDuration.Observe(duration.Seconds())
+	m.gcObjectsDeleted.Add(float64(stats.ObjectsDeletedAfterGracePeriod))
+
+	if result == "succeeded" {
+		m.gcLastRun.SetToCurrentTime()
+	}
+}
+
 func (s *Service) refreshInventory(ctx context.Context) error {
 	poolStat := s.Pool.Stat()
 	s.Metrics.dbConnsInUse.Set(float64(poolStat.AcquiredConns()))
@@ -180,7 +182,7 @@ func (s *Service) refreshInventory(ctx context.Context) error {
 
 	stats, err := queries.GetObjectStats(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("object stats: %w", err)
 	}
 
 	s.Metrics.cacheObjects.Set(float64(stats.ObjectCount))
@@ -188,7 +190,7 @@ func (s *Service) refreshInventory(ctx context.Context) error {
 
 	pending, err := queries.CountPendingClosures(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("count pending closures: %w", err)
 	}
 
 	s.Metrics.pendingClosures.Set(float64(pending))
