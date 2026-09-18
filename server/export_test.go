@@ -157,3 +157,8 @@ func TrustedKeysWithSigning(configured []string, signingKeys []signing.Signer) (
 
 // ProxyContentType is an export of proxyContentType for tests.
 func ProxyContentType(key, reported string) string { return proxyContentType(key, reported) }
+
+// SetIdleBudget shortens the idle budget of unknown-size transfers.
+func (p *PullThrough) SetIdleBudget(d time.Duration) {
+	p.idleBudget = d
+}
