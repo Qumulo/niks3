@@ -43,7 +43,9 @@ BEGIN
 
     INSERT INTO closures (updated_at, key)
     SELECT timezone('UTC', now()), unnest(push_roots)
-    ON CONFLICT (key) DO UPDATE SET updated_at = EXCLUDED.updated_at;
+    -- As in commit_pending_closure, an upload takes over a root the read
+    -- proxy pulled earlier, for every root and not only the first.
+    ON CONFLICT (key) DO UPDATE SET updated_at = EXCLUDED.updated_at, pulled_sig = NULL;
 
     -- The push's key is its first root, so this adds nothing new to closures.
     PERFORM commit_pending_closure(push_id);
