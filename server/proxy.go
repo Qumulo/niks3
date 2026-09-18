@@ -293,7 +293,7 @@ func (s *Service) handleProxyHead(w http.ResponseWriter, r *http.Request, key st
 
 	s.S3RateLimiter.RecordSuccess()
 
-	setProxyHeaders(w, &objInfo)
+	setProxyHeaders(w, key, &objInfo)
 
 	// For narinfos we decompress on GET, so the compressed Content-Length
 	// from S3 would be wrong. Omit it — HTTP allows HEAD without Content-Length.
@@ -402,7 +402,7 @@ func (s *Service) handleProxyGet(w http.ResponseWriter, r *http.Request, key str
 		slog.Debug("Failed to extend write deadline", "key", key, "error", err)
 	}
 
-	setProxyHeaders(w, &objInfo)
+	setProxyHeaders(w, key, &objInfo)
 	w.Header().Set("Accept-Ranges", "bytes")
 
 	if rng != nil {
@@ -482,10 +482,42 @@ func (s *Service) serveDecompressedNarinfo(w http.ResponseWriter, obj *minio.Obj
 	_, _ = w.Write(plain) //nolint:gosec // G705: narinfo text, never served as HTML
 }
 
+// proxyContentType picks the Content-Type for a proxied object. S3's own
+// answer wins when it is specific. When the store reports nothing or a
+// generic octet-stream (some S3 implementations do not persist the type
+// set at upload, and older niks3 clients uploaded NARs, listings and
+// realisations as octet-stream) the type is derived from the key, using
+// the same types Nix's binary cache stores write. Without this a browser
+// downloads index.html instead of rendering it.
+func proxyContentType(key, reported string) string {
+	switch strings.ToLower(reported) {
+	case "", "application/octet-stream", "binary/octet-stream":
+	default:
+		return reported
+	}
+
+	switch {
+	case key == "index.html":
+		return "text/html; charset=utf-8"
+	case key == "nix-cache-info":
+		return "text/x-nix-cache-info"
+	case narinfoRe.MatchString(key):
+		return "text/x-nix-narinfo"
+	case narRe.MatchString(key):
+		return "application/x-nix-nar"
+	case lsRe.MatchString(key), realisationsRe.MatchString(key):
+		return "application/json"
+	case logRe.MatchString(key):
+		return "text/plain; charset=utf-8"
+	}
+
+	return reported
+}
+
 // setProxyHeaders sets response headers from S3 object metadata.
-func setProxyHeaders(w http.ResponseWriter, info *minio.ObjectInfo) {
-	if info.ContentType != "" {
-		w.Header().Set("Content-Type", info.ContentType)
+func setProxyHeaders(w http.ResponseWriter, key string, info *minio.ObjectInfo) {
+	if ct := proxyContentType(key, info.ContentType); ct != "" {
+		w.Header().Set("Content-Type", ct)
 	}
 
 	if info.ETag != "" {
