@@ -800,6 +800,76 @@ func TestPullThroughNarVerifiedFromDatabase(t *testing.T) {
 	}
 }
 
+// A chunked upstream with no FileSize to size the transfer by must be
+// bounded by progress, not by the flat budget for a zero-byte object.
+func TestPullThroughUnknownSizeBoundedByProgress(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	upstream := newFakeUpstream(t)
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 2<<20))
+
+	// FileSize is not covered by the signature, so dropping it keeps the
+	// narinfo valid while leaving the NAR's size unknown.
+	var lines []string
+
+	for line := range strings.SplitSeq(string(fx.narinfo), "\n") {
+		if !strings.HasPrefix(line, "FileSize:") {
+			lines = append(lines, line)
+		}
+	}
+
+	upstream.put(fx.narinfoKey, []byte(strings.Join(lines, "\n")))
+	upstream.put(fx.narKey, fx.nar)
+
+	// Trickle the NAR chunked over well over the idle budget below.
+	upstream.beforeServe = func(key string, w http.ResponseWriter) bool {
+		if key != fx.narKey {
+			return false
+		}
+
+		w.WriteHeader(http.StatusOK)
+
+		flusher, _ := w.(http.Flusher)
+
+		for off := 0; off < len(fx.nar); off += 64 << 10 {
+			end := min(off+64<<10, len(fx.nar))
+			_, _ = w.Write(fx.nar[off:end])
+
+			if flusher != nil {
+				flusher.Flush()
+			}
+
+			time.Sleep(20 * time.Millisecond)
+		}
+
+		return true
+	}
+
+	service := createPullThroughTestService(t, upstream, fx.publicKey)
+	defer service.Close()
+
+	service.PullThrough.SetIdleBudget(200 * time.Millisecond)
+
+	ts := setupProxyServer(t, service)
+	defer ts.Close()
+
+	proxyGet(t, ts, "/"+fx.narinfoKey, http.StatusOK)
+
+	header, body := proxyGet(t, ts, "/"+fx.narKey, http.StatusOK)
+	if header.Get("Content-Length") != "" {
+		t.Errorf("Content-Length = %q, want none for an unknown size", header.Get("Content-Length"))
+	}
+
+	if !bytes.Equal(body, fx.nar) {
+		t.Fatalf("got %d bytes, want the whole %d-byte NAR", len(body), len(fx.nar))
+	}
+
+	if stored := waitForFill(ctx, t, service, fx.narKey); !bytes.Equal(stored, fx.nar) {
+		t.Fatal("NAR not stored intact")
+	}
+}
+
 func TestPullThroughNarLongerThanFileSizeNotStored(t *testing.T) {
 	t.Parallel()
 	forEachS3Transport(t, testPullThroughNarLongerThanFileSizeNotStored)

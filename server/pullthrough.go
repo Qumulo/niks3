@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"log/slog"
 	"math"
@@ -52,6 +53,11 @@ const (
 
 	// pullThroughDBTimeout bounds bookkeeping writes detached from a request.
 	pullThroughDBTimeout = 10 * time.Second
+
+	// pullThroughBudgetRenewal is how often, at most, a progressing
+	// transfer of unknown size renews its idle budget; the write deadline
+	// is a syscall.
+	pullThroughBudgetRenewal = time.Second
 
 	// pullThroughDefaultConcurrency bounds simultaneous NAR fills. Each
 	// holds up to a multipart part in memory, so this is a memory knob.
@@ -121,9 +127,12 @@ type PullThrough struct {
 	upstreams   []*url.URL
 	trustedKeys []*signing.PublicKey
 	negativeTTL time.Duration
-	client      *http.Client
-	narSem      chan struct{}
-	narinfoSem  chan struct{}
+	// idleBudget is how long a NAR transfer of unknown size may go
+	// without progress before it is cut off.
+	idleBudget time.Duration
+	client     *http.Client
+	narSem     chan struct{}
+	narinfoSem chan struct{}
 
 	mu       sync.Mutex
 	inflight map[string]struct{}
@@ -153,6 +162,7 @@ func NewPullThrough(cfg PullThroughConfig) (*PullThrough, error) {
 
 	p := &PullThrough{
 		negativeTTL: cfg.NegativeTTL,
+		idleBudget:  proxyTimeoutSlack,
 		narSem:      make(chan struct{}, concurrency),
 		narinfoSem:  make(chan struct{}, narinfoConcurrency),
 		inflight:    make(map[string]struct{}),
@@ -838,15 +848,10 @@ func (s *Service) pullThroughNar(w http.ResponseWriter, r *http.Request, key str
 		return
 	}
 
-	// Bound the whole transfer by size, as the S3 streaming path does.
-	budget := ProxyWriteTimeout(size)
-	timer := time.AfterFunc(budget, cancel)
+	budget := newTransferBudget(w, cancel, size, p.idleBudget, key)
+	defer budget.stop()
 
-	defer timer.Stop()
-
-	if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(budget)); err != nil {
-		slog.Debug("Failed to extend write deadline", "key", key, "error", err)
-	}
+	body := budget.reader(resp.Body)
 
 	w.Header().Set("Content-Type", proxyContentType(key, ""))
 	w.Header().Set(cacheStatusHeader, "MISS")
@@ -860,7 +865,7 @@ func (s *Service) pullThroughNar(w http.ResponseWriter, r *http.Request, key str
 	if !haveMeta {
 		slog.Warn("Streaming NAR without its narinfo's FileHash; not stored", "key", key)
 
-		n, _ := io.Copy(w, resp.Body)
+		n, _ := io.Copy(w, body)
 		s.Metrics.addPullThroughBytes(n)
 		s.Metrics.recordPullThrough(kindNar, "unverified")
 
@@ -869,7 +874,7 @@ func (s *Service) pullThroughNar(w http.ResponseWriter, r *http.Request, key str
 
 	if !p.beginFill(key) {
 		// Another request is filling this key; stream without persisting.
-		n, _ := io.Copy(w, resp.Body)
+		n, _ := io.Copy(w, body)
 		s.Metrics.addPullThroughBytes(n)
 		s.Metrics.recordPullThrough(kindNar, "passthrough")
 
@@ -877,11 +882,88 @@ func (s *Service) pullThroughNar(w http.ResponseWriter, r *http.Request, key str
 	}
 	defer p.endFill(key)
 
-	s.fillNar(ctx, cancel, w, r, key, resp.Body, size, meta)
+	fan := &fanOut{client: w, clientCtx: r.Context(), clientLeft: size, hasher: sha256.New()}
+	s.fillNar(ctx, cancel, key, body, size, meta, fan)
 }
 
-// fillNar fans body out to the client and to an S3 upload. The S3 side is
-// primary: the client is dropped on its first write error, while an S3
+// transferBudget bounds a NAR transfer. With a known size it is one
+// deadline proportional to the size, as the S3 streaming path uses. With
+// an unknown size (a chunked upstream, no narinfo FileSize) it is an idle
+// budget renewed as bytes flow: a flat deadline would cut off any large
+// NAR from such an upstream on every attempt.
+type transferBudget struct {
+	idle    time.Duration // 0 when the size was known
+	renewal time.Duration // how long between renewals
+	timer   *time.Timer
+	rc      *http.ResponseController
+	renewed time.Time
+	key     string
+}
+
+func newTransferBudget(w http.ResponseWriter, cancel context.CancelFunc, size int64, idle time.Duration, key string) *transferBudget {
+	b := &transferBudget{rc: http.NewResponseController(w), key: key}
+
+	d := ProxyWriteTimeout(size)
+	if size < 0 {
+		b.idle = idle
+		b.renewal = min(pullThroughBudgetRenewal, idle/4)
+		d = idle
+	}
+
+	b.timer = time.AfterFunc(d, cancel)
+	b.renewed = time.Now()
+	b.setWriteDeadline(d)
+
+	return b
+}
+
+func (b *transferBudget) setWriteDeadline(d time.Duration) {
+	if err := b.rc.SetWriteDeadline(time.Now().Add(d)); err != nil {
+		slog.Debug("Failed to extend write deadline", "key", b.key, "error", err)
+	}
+}
+
+// progress renews an idle budget. A known-size budget does not move.
+func (b *transferBudget) progress() {
+	if b.idle == 0 {
+		return
+	}
+
+	now := time.Now()
+	if now.Sub(b.renewed) < b.renewal {
+		return
+	}
+
+	b.renewed = now
+	b.timer.Reset(b.idle)
+	b.setWriteDeadline(b.idle)
+}
+
+func (b *transferBudget) stop() {
+	b.timer.Stop()
+}
+
+// reader wraps r so every successful read counts as progress.
+func (b *transferBudget) reader(r io.Reader) io.Reader {
+	return &progressReader{r: r, progress: b.progress}
+}
+
+type progressReader struct {
+	r        io.Reader
+	progress func()
+}
+
+func (p *progressReader) Read(buf []byte) (int, error) {
+	n, err := p.r.Read(buf)
+	if n > 0 {
+		p.progress()
+	}
+
+	return n, err //nolint:wrapcheck // transparent wrapper
+}
+
+// fillNar fans body out through fan to its client and to an S3 upload. The
+// S3 side is primary: the client is dropped on its first write error, while an S3
 // failure only stops the fill. The NAR is hashed inline and the S3 side
 // lags the client by one chunk, so the last chunk is only released once
 // the whole body has been read and verified against the size and the
@@ -892,14 +974,14 @@ func (s *Service) pullThroughNar(w http.ResponseWriter, r *http.Request, key str
 func (s *Service) fillNar(
 	ctx context.Context,
 	cancel context.CancelFunc,
-	w http.ResponseWriter,
-	r *http.Request,
 	key string,
 	body io.Reader,
 	size int64,
 	meta narMeta,
+	fan *fanOut,
 ) {
 	pr, pw := io.Pipe()
+	fan.s3 = pw
 	putDone := make(chan error, 1)
 
 	go func() {
@@ -914,8 +996,6 @@ func (s *Service) fillNar(
 		putDone <- err
 	}()
 
-	hasher := sha256.New()
-	fan := &fanOut{s3: pw, client: w, clientCtx: r.Context(), clientLeft: size, hasher: hasher}
 	buf := make([]byte, pullThroughCopyBuf)
 
 	var readErr error
@@ -943,7 +1023,7 @@ func (s *Service) fillNar(
 
 	var verifyErr error
 	if readErr == nil {
-		verifyErr = verifyPulledNar(fan.total, size, hasher.Sum(nil), meta)
+		verifyErr = verifyPulledNar(fan.total, size, fan.hasher.Sum(nil), meta)
 	}
 
 	switch {
@@ -1060,7 +1140,7 @@ type fanOut struct {
 	// that runs long is still read and hashed in full, so the fill can
 	// reject it, but the client gets a well-formed response.
 	clientLeft int64
-	hasher     io.Writer
+	hasher     hash.Hash
 	hold       []byte // the chunk S3 has not been given yet
 	total      int64
 	s3Down     bool
