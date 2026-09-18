@@ -60,8 +60,7 @@ func (s *Service) requestScopes(r *http.Request) ([]oidc.Scope, bool) {
 		return nil, false
 	}
 
-	slog.Info("OIDC auth successful", "provider", claims.Provider, "scopes", claims.Scopes)
-	slog.Debug("OIDC auth details", "subject", claims.Subject)
+	slog.Info("OIDC auth successful", "provider", claims.Provider, "subject", claims.Subject, "scopes", claims.Scopes)
 
 	scopes := claims.Scopes
 	// Anyone who may upload or administer may also read.
