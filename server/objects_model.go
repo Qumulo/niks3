@@ -114,6 +114,16 @@ func (s *Service) cleanupOrphanObjects(ctx context.Context, gracePeriod int32, o
 		}
 	}
 
+	// Keep what became reachable again since it was marked; see the query.
+	resurrected, err := pg.New(s.Pool).ResurrectReachableObjects(ctx)
+	if err != nil {
+		return stats, fmt.Errorf("failed to resurrect reachable objects: %w", err)
+	}
+
+	if resurrected > 0 {
+		slog.Info("Kept tombstoned objects that are reachable again", "count", resurrected)
+	}
+
 	marked, err := pg.New(s.Pool).MarkStaleObjects(ctx)
 	if err != nil {
 		return stats, fmt.Errorf("failed to mark stale objects: %w", err)
