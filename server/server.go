@@ -56,6 +56,16 @@ type options struct {
 	// lifetime instead of streaming them. Requires EnableReadProxy.
 	ReadRedirectTTL time.Duration
 
+	// PullThrough, when it has upstreams, makes the read proxy fill the
+	// bucket from those caches on a miss. Requires EnableReadProxy.
+	PullThrough PullThroughConfig
+
+	// TrustedKeys are the "name:base64" public keys one of which must have
+	// signed an upstream narinfo for the read proxy to serve and store it.
+	// The public keys of SignKeyPaths are always trusted as well, so the
+	// set is never empty when pull-through is on.
+	TrustedKeys []string
+
 	// MaxNarSize is the maximum uncompressed NAR size in bytes accepted for
 	// upload. 0 means unlimited.
 	MaxNarSize uint64
@@ -121,6 +131,9 @@ type Service struct {
 	// See options.ReadRedirectTTL.
 	ReadRedirectTTL time.Duration
 
+	// PullThrough is nil unless upstream fills are enabled.
+	PullThrough *PullThrough
+
 	// MaxNarSize is advertised via /api/cache-config and enforced on
 	// pending-closure creation. 0 means unlimited.
 	MaxNarSize uint64
@@ -164,6 +177,32 @@ const (
 	shutdownTimeout = 10 * time.Second
 )
 
+// trustedKeysWithSigning is the read proxy's trusted set: the configured
+// keys plus the public half of every signing key, which cannot be left
+// out. A narinfo niks3 signed itself (served back by a mirror, or by
+// another niks3 fed from this one) is always one it vouches for.
+func trustedKeysWithSigning(configured []string, signingKeys []*signing.Key) ([]string, error) {
+	keys := make([]string, 0, len(configured)+len(signingKeys))
+	keys = append(keys, configured...)
+
+	for _, k := range signingKeys {
+		pub, err := k.PublicKey()
+		if err != nil {
+			return nil, fmt.Errorf("public key of signing key %s: %w", k.Name, err)
+		}
+
+		keys = append(keys, pub)
+	}
+
+	return keys, nil
+}
+
+// URL schemes the S3 endpoint and pull-through upstreams may use.
+const (
+	schemeHTTP  = "http"
+	schemeHTTPS = "https"
+)
+
 // NewPresignClient returns a client for signing client-facing URLs against
 // publicURL (http(s)://host[:port]). Presigning is offline as long as the
 // region is known, so the bucket region is resolved via the internal client
@@ -176,7 +215,7 @@ func NewPresignClient(
 	lookup minio.BucketLookupType,
 ) (*minio.Client, error) {
 	u, err := url.Parse(publicURL)
-	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || (u.Path != "" && u.Path != "/") {
+	if err != nil || u.Host == "" || (u.Scheme != schemeHTTP && u.Scheme != schemeHTTPS) || (u.Path != "" && u.Path != "/") {
 		return nil, fmt.Errorf("invalid S3 public URL %q: expected http(s)://host[:port]", publicURL)
 	}
 
@@ -189,7 +228,7 @@ func NewPresignClient(
 
 	client, err := minio.New(u.Host, &minio.Options{
 		Creds:        creds,
-		Secure:       u.Scheme == "https",
+		Secure:       u.Scheme == schemeHTTPS,
 		Region:       region,
 		BucketLookup: lookup,
 	})
@@ -345,6 +384,10 @@ func runServer(opts *options) error {
 
 		if opts.ReadRedirectTTL > 0 {
 			slog.Info("NAR reads redirect to presigned S3 URLs", "ttl", opts.ReadRedirectTTL)
+		}
+
+		if err := service.enablePullThrough(opts); err != nil {
+			return err
 		}
 	} else {
 		mux.HandleFunc("GET /", service.RootRedirectHandler)
@@ -608,4 +651,33 @@ func (s *Service) uploadLandingPage(ctx context.Context) {
 
 	s.S3RateLimiter.RecordSuccess()
 	slog.Info("Uploaded landing page to bucket", "bucket", s.Bucket)
+}
+
+// enablePullThrough builds the upstream client when upstreams are
+// configured; without any it is a no-op and the read proxy serves the
+// bucket alone.
+func (s *Service) enablePullThrough(opts *options) error {
+	if len(opts.PullThrough.Upstreams) == 0 {
+		return nil
+	}
+
+	cfg := opts.PullThrough
+
+	keys, err := trustedKeysWithSigning(opts.TrustedKeys, s.SigningKeys)
+	if err != nil {
+		return err
+	}
+
+	cfg.TrustedKeys = keys
+
+	pullThrough, err := NewPullThrough(cfg)
+	if err != nil {
+		return err
+	}
+
+	s.PullThrough = pullThrough
+	slog.Info("Pull-through enabled — misses are filled from upstream caches",
+		"upstreams", pullThrough.Upstreams(), "trusted_keys", pullThrough.TrustedKeyNames())
+
+	return nil
 }
