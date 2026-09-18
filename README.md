@@ -86,6 +86,12 @@ Only narinfos and NARs are filled; listings, logs and realisations still 404.
   the trusted list. Pinned closures are kept and reported.
 - Upstream 404s are remembered for `--pull-through-negative-ttl` (default 1m).
   Responses carry `X-Cache-Status: HIT`, `MISS` or `NEGATIVE`.
+- Every object a fill writes is tagged with `x-amz-meta-niks3-pulled` (the
+  verifying signature on a narinfo, the narinfo key on a NAR). A tagged
+  object the database has no row for, which is what a registration that
+  failed after the S3 write leaves behind, is adopted on its next read:
+  re-verified against the trusted keys and rooted again. Untagged objects
+  are never adopted.
 - `--pull-through-concurrency` (default 16) bounds NAR fills, each of which may
   buffer a 16 MiB multipart part. The cheap narinfo fills are bounded separately
   by `--pull-through-narinfo-concurrency` (default 256), so a nixpkgs bump does
