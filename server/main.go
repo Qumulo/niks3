@@ -155,6 +155,64 @@ func validateReadRedirect(opts *options) error {
 	return nil
 }
 
+// validateReadProxy checks the options that only make sense with the read
+// proxy on: presigned redirects and upstream fills.
+func validateReadProxy(opts *options) error {
+	if err := validateReadRedirect(opts); err != nil {
+		return err
+	}
+
+	return validatePullThrough(opts)
+}
+
+func validatePullThrough(opts *options) error {
+	if len(opts.PullThrough.Upstreams) > 0 && !opts.EnableReadProxy {
+		return errors.New("--pull-through-upstream requires --enable-read-proxy")
+	}
+
+	if opts.PullThrough.NegativeTTL < 0 {
+		return errors.New("--pull-through-negative-ttl must not be negative")
+	}
+
+	if opts.PullThrough.NarinfoConcurrency < 0 {
+		return errors.New("--pull-through-narinfo-concurrency must not be negative")
+	}
+
+	if len(opts.PullThrough.Upstreams) > 0 && len(opts.TrustedKeys) == 0 && len(opts.SignKeyPaths) == 0 {
+		return errors.New("--pull-through-upstream requires --trusted-key or --sign-key-path")
+	}
+
+	return nil
+}
+
+// pullThroughFlags defines the read proxy's upstream-fill flags, each
+// seeded from its environment variable.
+func pullThroughFlags(opts *options) {
+	pullUpstreams := (*stringSliceFlag)(&opts.PullThrough.Upstreams)
+	for u := range strings.FieldsSeq(getEnvOrDefault("NIKS3_PULL_THROUGH_UPSTREAMS", "")) {
+		_ = pullUpstreams.Set(u)
+	}
+
+	flag.Var(pullUpstreams, "pull-through-upstream",
+		"Binary cache URL to fill misses from (e.g. https://cache.nixos.org). Repeat to try several in order. "+
+			"Requires --enable-read-proxy. Env: NIKS3_PULL_THROUGH_UPSTREAMS (space-separated)")
+
+	trustedKeys := (*stringSliceFlag)(&opts.TrustedKeys)
+	for k := range strings.FieldsSeq(getEnvOrDefault("NIKS3_TRUSTED_KEYS", "")) {
+		_ = trustedKeys.Set(k)
+	}
+
+	flag.Var(trustedKeys, "trusted-key",
+		"Public key (name:base64) an upstream narinfo must be signed with to be served and stored. Repeat for several. "+
+			"The public keys of --sign-key-path are always trusted as well. Env: NIKS3_TRUSTED_KEYS (space-separated)")
+	flag.DurationVar(&opts.PullThrough.NegativeTTL, "pull-through-negative-ttl",
+		getEnvOrDefaultDuration("NIKS3_PULL_THROUGH_NEGATIVE_TTL", time.Minute),
+		"How long an upstream 404 is remembered before asking again")
+	flag.IntVar(&opts.PullThrough.NarinfoConcurrency, "pull-through-narinfo-concurrency",
+		getEnvOrDefaultInt("NIKS3_PULL_THROUGH_NARINFO_CONCURRENCY", pullThroughDefaultNarinfoConcurrency),
+		"Maximum concurrent narinfo fills from upstream")
+}
+
 func parseArgs() (*options, error) {
 	var opts options
 
@@ -227,6 +285,8 @@ func parseArgs() (*options, error) {
 		getEnvOrDefaultDuration("NIKS3_READ_REDIRECT_TTL", 0),
 		"Answer NAR reads with a redirect to a presigned S3 URL valid for this long (e.g. 15m) instead of "+
 			"streaming them. Requires --enable-read-proxy. 0 disables")
+
+	pullThroughFlags(&opts)
 	flag.BoolVar(&opts.Debug, "debug", getEnvOrDefaultBool("NIKS3_DEBUG", false),
 		"Enable debug logging (may leak sensitive information)")
 
@@ -312,7 +372,7 @@ func parseArgs() (*options, error) {
 		return nil, errors.New("missing required flag: --api-token or --api-token-path")
 	}
 
-	if err := validateReadRedirect(&opts); err != nil {
+	if err := validateReadProxy(&opts); err != nil {
 		return nil, err
 	}
 

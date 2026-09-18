@@ -81,5 +81,10 @@ func (n *Narinfo) SigningInfo() *signing.NarInfo { return n.signingInfo() }
 
 func HashMatches(nixHash string, digest []byte) bool { return hashMatches(nixHash, digest) }
 
+// TrustedKeysWithSigning is an export of trustedKeysWithSigning for tests.
+func TrustedKeysWithSigning(configured []string, signingKeys []*signing.Key) ([]string, error) {
+	return trustedKeysWithSigning(configured, signingKeys)
+}
+
 // ProxyContentType is an export of proxyContentType for tests.
 func ProxyContentType(key, reported string) string { return proxyContentType(key, reported) }
