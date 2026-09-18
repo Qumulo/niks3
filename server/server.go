@@ -517,7 +517,7 @@ func (s *Service) InitializeBucket(ctx context.Context) error {
 
 	_, err := s.MinioClient.PutObject(ctx, s.Bucket, "nix-cache-info",
 		strings.NewReader(cacheInfo), int64(len(cacheInfo)),
-		minio.PutObjectOptions{ContentType: "text/plain"})
+		minio.PutObjectOptions{ContentType: "text/x-nix-cache-info"})
 	if err != nil {
 		if isRateLimitError(err) {
 			s.S3RateLimiter.RecordThrottle()

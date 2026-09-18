@@ -20,6 +20,16 @@ import (
 	"github.com/Mic92/niks3/ratelimit"
 )
 
+// Content-Types Nix's own binary cache stores upload with
+// (src/libstore/binary-cache-store.cc). Nix never reads them back, but
+// browsers, curl and S3 tooling do, and a read proxy can pass them on
+// instead of guessing from the key.
+const (
+	headerContentType = "Content-Type"
+	contentTypeNar    = "application/x-nix-nar"
+	contentTypeJSON   = "application/json"
+)
+
 // compressionZstd is the algorithm name used in Content-Encoding headers
 // and narinfo Compression fields.
 const compressionZstd = "zstd"
@@ -242,7 +252,7 @@ func (c *Client) putBytes(ctx context.Context, url string, data []byte) (*http.R
 	}
 
 	req.ContentLength = int64(len(data))
-	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set(headerContentType, "application/octet-stream")
 
 	resp, err := c.DoS3Request(ctx, req)
 	if err != nil {
