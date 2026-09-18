@@ -499,6 +499,52 @@ func (s *Service) markProxyHit(w http.ResponseWriter, key string) {
 	}
 }
 
+// redirectOrPull is the NAR path in redirect mode. The objects table says
+// whether the NAR is tracked and live, which avoids an S3 HEAD before every
+// presign. A database error degrades to today's behaviour: a blind presign
+// that 404s at S3 when the object is missing.
+func (s *Service) redirectOrPull(w http.ResponseWriter, r *http.Request, key string) {
+	if s.PullThrough == nil {
+		s.redirectToS3(w, r, key)
+
+		return
+	}
+
+	if s.objectIsLive(r.Context(), key) {
+		s.redirectToS3(w, r, key)
+
+		return
+	}
+
+	// Not tracked: objects written outside niks3 never are, so confirm
+	// against S3 before filling from upstream.
+	if err := s.S3RateLimiter.Wait(r.Context()); err != nil {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+
+		return
+	}
+
+	if _, ok := s.statOrPull(w, r, key); ok {
+		s.redirectToS3(w, r, key)
+	}
+}
+
+func (s *Service) objectIsLive(ctx context.Context, key string) bool {
+	live, err := pg.New(s.Pool).ObjectIsLive(ctx, key)
+	if err != nil {
+		slog.Warn("Failed to check whether object is live; redirecting blindly", "key", key, "error", err)
+		s.Metrics.recordPullThroughLiveCheckError()
+
+		return true
+	}
+
+	if live {
+		s.Metrics.recordPullThrough(kindNar, "hit")
+	}
+
+	return live
+}
+
 func (s *Service) pullThroughNotFound(w http.ResponseWriter, r *http.Request, kind, result string) {
 	w.Header().Set(cacheStatusHeader, strings.ToUpper(result))
 	http.NotFound(w, r)
