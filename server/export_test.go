@@ -89,6 +89,20 @@ func TrustedKeysWithSigning(configured []string, signingKeys []*signing.Key) ([]
 // ProxyContentType is an export of proxyContentType for tests.
 func ProxyContentType(key, reported string) string { return proxyContentType(key, reported) }
 
+// ForgetChecks clears the tracked-check debounce so a test can observe the
+// next check without waiting an hour.
+func (p *PullThrough) ForgetChecks() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	clear(p.checked)
+}
+
+// WaitChecks returns once every tracked check started so far has finished.
+func (p *PullThrough) WaitChecks() {
+	p.checks.Wait()
+}
+
 // SetIdleBudget shortens the idle budget of unknown-size transfers.
 func (p *PullThrough) SetIdleBudget(d time.Duration) {
 	p.idleBudget = d

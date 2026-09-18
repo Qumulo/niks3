@@ -39,6 +39,11 @@ const (
 	// upstream requests.
 	pullThroughMapCap = 100_000
 
+	// pullThroughCheckInterval debounces the check that a served pulled
+	// object is still tracked, so a hot path costs one SELECT per hour
+	// instead of one per request.
+	pullThroughCheckInterval = time.Hour
+
 	// pullThroughPartSize is the multipart part size when the upstream does
 	// not announce a Content-Length. Bounds per-fill memory: minio would
 	// otherwise size parts for a 5 TiB object.
@@ -71,6 +76,15 @@ const (
 
 	// cacheStatusHeader mirrors nginx's X-Cache-Status on proxied reads.
 	cacheStatusHeader = "X-Cache-Status"
+
+	// pulledMetaKey tags every object a fill writes, as S3 user metadata.
+	// A narinfo carries the signature it was verified with, a NAR the key
+	// of the narinfo it was checked against. The value is informational:
+	// the tag's job is to say niks3 wrote the object, so the hit path can
+	// adopt one the database does not know (what a registration that
+	// failed after the S3 write leaves behind) while objects other tools
+	// wrote are left alone.
+	pulledMetaKey = "niks3-pulled"
 
 	kindNarinfo = "narinfo"
 	kindNar     = "nar"
@@ -121,8 +135,8 @@ func narMetaFromNarinfo(key string, info *narinfo) (narMeta, bool) {
 }
 
 // PullThrough holds the upstream client and the in-memory bookkeeping for
-// fills: which keys are being filled, recent upstream 404s and NAR
-// metadata learned from narinfos.
+// fills: which keys are being filled, recent upstream 404s, NAR metadata
+// learned from narinfos, and which served keys were recently checked.
 type PullThrough struct {
 	upstreams   []*url.URL
 	trustedKeys []*signing.PublicKey
@@ -138,6 +152,9 @@ type PullThrough struct {
 	inflight map[string]struct{}
 	negative map[string]time.Time
 	narMeta  map[string]narMeta
+	checked  map[string]time.Time
+	// checks counts the tracked checks running detached from a request.
+	checks sync.WaitGroup
 }
 
 // NewPullThrough validates cfg and builds the upstream client.
@@ -168,6 +185,7 @@ func NewPullThrough(cfg PullThroughConfig) (*PullThrough, error) {
 		inflight:    make(map[string]struct{}),
 		negative:    make(map[string]time.Time),
 		narMeta:     make(map[string]narMeta),
+		checked:     make(map[string]time.Time),
 	}
 
 	for _, raw := range cfg.Upstreams {
@@ -347,6 +365,27 @@ func (s *Service) pulledNarMeta(ctx context.Context, narKey string) (narMeta, bo
 	return meta, true
 }
 
+// shouldCheck reports whether a served key is due for its tracked check
+// and records that it was made.
+func (p *PullThrough) shouldCheck(key string) bool {
+	now := time.Now()
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if last, ok := p.checked[key]; ok && now.Sub(last) < pullThroughCheckInterval {
+		return false
+	}
+
+	if len(p.checked) >= pullThroughMapCap {
+		clear(p.checked)
+	}
+
+	p.checked[key] = now
+
+	return true
+}
+
 // fetch tries each upstream in order. It returns errUpstreamNotFound when
 // every upstream answered 404, otherwise the last failure. The caller owns
 // resp.Body. With a Range, a 206 is accepted too; an upstream that ignores
@@ -463,6 +502,19 @@ func zstdCompress(data []byte) ([]byte, error) {
 	return encoder.EncodeAll(data, nil), nil
 }
 
+// pullKind classifies key as one of the two kinds a fill can answer, a
+// narinfo or a NAR, or "" for anything else.
+func pullKind(key string) string {
+	switch {
+	case narinfoRe.MatchString(key):
+		return kindNarinfo
+	case narRe.MatchString(key):
+		return kindNar
+	}
+
+	return ""
+}
+
 // pullThroughMiss handles an S3 miss for a key pull-through can fill.
 // Returns false when pull-through is off, err is not a missing key, or the
 // key is not a narinfo or NAR, in which case the caller reports the error.
@@ -471,10 +523,10 @@ func (s *Service) pullThroughMiss(w http.ResponseWriter, r *http.Request, key st
 		return false
 	}
 
-	switch {
-	case narinfoRe.MatchString(key):
+	switch pullKind(key) {
+	case kindNarinfo:
 		s.pullThroughNarinfo(w, r, key)
-	case narRe.MatchString(key):
+	case kindNar:
 		s.pullThroughNar(w, r, key)
 	default:
 		return false
@@ -483,20 +535,153 @@ func (s *Service) pullThroughMiss(w http.ResponseWriter, r *http.Request, key st
 	return true
 }
 
-// markProxyHit labels a read served from S3.
-func (s *Service) markProxyHit(w http.ResponseWriter, key string) {
+// markProxyHit labels a read served from S3 and, for an object a fill
+// wrote, makes sure the database still knows it.
+func (s *Service) markProxyHit(w http.ResponseWriter, r *http.Request, key string, hit *minio.ObjectInfo) {
 	if s.PullThrough == nil {
 		return
 	}
 
 	w.Header().Set(cacheStatusHeader, "HIT")
 
-	switch {
-	case narinfoRe.MatchString(key):
-		s.Metrics.recordPullThrough(kindNarinfo, "hit")
-	case narRe.MatchString(key):
-		s.Metrics.recordPullThrough(kindNar, "hit")
+	if kind := pullKind(key); kind != "" {
+		s.Metrics.recordPullThrough(kind, "hit")
+		s.checkPulledTracked(r.Context(), key, hit)
 	}
+}
+
+// pulledTag returns the pull-through tag of an object served from S3, or
+// "" when there is no ObjectInfo or the object was not written by a fill.
+func pulledTag(hit *minio.ObjectInfo) string {
+	if hit == nil {
+		return ""
+	}
+
+	return hit.Metadata.Get("x-amz-meta-" + pulledMetaKey)
+}
+
+// checkPulledTracked makes sure an object a fill wrote (hit carries the
+// tag) still has a row, at most once per key per hour, and adopts it when
+// it does not. The database may have lost track of it: the registration
+// after the S3 write failed, or the process died in between.
+func (s *Service) checkPulledTracked(ctx context.Context, key string, hit *minio.ObjectInfo) {
+	tag := pulledTag(hit)
+	if tag == "" || !s.PullThrough.shouldCheck(key) {
+		return
+	}
+
+	s.PullThrough.checks.Go(func() {
+		// The check must outlive the request, so only the values are kept.
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pullThroughDBTimeout)
+		defer cancel()
+
+		s.adoptPulled(ctx, key, tag)
+	})
+}
+
+// adoptPulled registers a tagged object the database has no row for.
+// Only an absent row qualifies: a tombstoned row is on its way out under
+// the normal expiry, and resurrecting it from a hit could race the S3
+// delete GC is about to issue for it.
+func (s *Service) adoptPulled(ctx context.Context, key, tag string) {
+	tracked, err := pg.New(s.Pool).ObjectIsTracked(ctx, key)
+	if err != nil {
+		slog.Warn("Failed to check whether pulled object is tracked", "key", key, "error", err)
+
+		return
+	}
+
+	if tracked {
+		return
+	}
+
+	slog.Warn("Pulled object is untracked; adopting it", "key", key, "tag", tag)
+
+	switch pullKind(key) {
+	case kindNarinfo:
+		s.adoptNarinfo(ctx, key)
+	case kindNar:
+		s.adoptNar(ctx, key)
+	}
+}
+
+// adoptNarinfo re-reads a stored narinfo, validates it exactly like an
+// upstream one (against the trusted keys of today, not of when it was
+// pulled) and registers it. One that no longer validates is left where
+// it is and logged: an object niks3 wrote but will not vouch for.
+func (s *Service) adoptNarinfo(ctx context.Context, key string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ProxyWriteTimeout(pullThroughMaxNarinfo))
+	defer cancel()
+
+	data, err := s.readStoredNarinfo(ctx, key)
+	if err != nil {
+		slog.Warn("Failed to read pulled narinfo for adoption", "key", key, "error", err)
+
+		return
+	}
+
+	pulled, err := s.PullThrough.validateNarinfo(key, data)
+	if err != nil {
+		slog.Error("Untracked pulled narinfo no longer validates; left in S3 untracked", "key", key, "reason", err.Error())
+
+		return
+	}
+
+	size := uint64(len(data))
+	if err := s.registerPulled(ctx, key, pulled.info.refKeys(), &size, pulled.info, pulled.sig); err != nil {
+		slog.Error("Failed to adopt pulled narinfo", "key", key, "error", err)
+
+		return
+	}
+
+	s.Metrics.recordPullThrough(kindNarinfo, "adopted")
+}
+
+// adoptNar registers a stored NAR. It was verified against its narinfo
+// when it was written (that is what the tag says), so nothing is re-read;
+// the narinfo's metadata supplies the size when it is still known.
+func (s *Service) adoptNar(ctx context.Context, key string) {
+	var narSize *uint64
+	if meta, ok := s.pulledNarMeta(ctx, key); ok && meta.narSize > 0 {
+		narSize = &meta.narSize
+	}
+
+	if err := s.registerPulled(ctx, key, nil, narSize, nil, ""); err != nil {
+		slog.Error("Failed to adopt pulled NAR", "key", key, "error", err)
+
+		return
+	}
+
+	s.Metrics.recordPullThrough(kindNar, "adopted")
+}
+
+// readStoredNarinfo reads a narinfo niks3 stored back into memory, through
+// the same reader as an upstream one: zstd with the magic sniffed, or
+// plain when a proxy decompressed it on the way in.
+func (s *Service) readStoredNarinfo(ctx context.Context, key string) ([]byte, error) {
+	if err := s.S3RateLimiter.Wait(ctx); err != nil {
+		return nil, fmt.Errorf("rate limiter: %w", err)
+	}
+
+	obj, err := s.MinioClient.GetObject(ctx, s.Bucket, key, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("get object: %w", err)
+	}
+
+	defer func() { _ = obj.Close() }()
+
+	data, err := readNarinfo(obj)
+	if err != nil {
+		if isRateLimitError(err) {
+			s.S3RateLimiter.RecordThrottle()
+		}
+
+		return nil, fmt.Errorf("read narinfo: %w", err)
+	}
+
+	s.S3RateLimiter.RecordSuccess()
+
+	return data, nil
 }
 
 // redirectOrPull is the NAR path in redirect mode. The objects table says
@@ -801,6 +986,7 @@ func (s *Service) persistNarinfo(ctx context.Context, key string, pulled *pulled
 		minio.PutObjectOptions{
 			ContentType:     proxyContentType(key, ""),
 			ContentEncoding: "zstd",
+			UserMetadata:    map[string]string{pulledMetaKey: pulled.sig},
 		})
 	if err != nil {
 		if isRateLimitError(err) {
@@ -1088,7 +1274,7 @@ func (s *Service) fillNar(
 	putDone := make(chan error, 1)
 
 	go func() {
-		err := s.putNar(ctx, key, pr, size)
+		err := s.putNar(ctx, key, pr, size, meta.narinfoKey)
 		// Close the read side whatever happened. On an error further
 		// pw.Write calls fail with err instead of blocking; after a
 		// successful completion (the body ran past the announced size,
@@ -1299,12 +1485,15 @@ func (f *fanOut) releaseHeld() {
 	}
 }
 
-func (s *Service) putNar(ctx context.Context, key string, body io.Reader, size int64) error {
+func (s *Service) putNar(ctx context.Context, key string, body io.Reader, size int64, narinfoKey string) error {
 	if err := s.S3RateLimiter.Wait(ctx); err != nil {
 		return fmt.Errorf("rate limiter: %w", err)
 	}
 
-	opts := minio.PutObjectOptions{ContentType: proxyContentType(key, "")}
+	opts := minio.PutObjectOptions{
+		ContentType:  proxyContentType(key, ""),
+		UserMetadata: map[string]string{pulledMetaKey: narinfoKey},
+	}
 	if size < 0 {
 		opts.PartSize = pullThroughPartSize
 	}
