@@ -86,6 +86,28 @@ spec:
             - name: NIKS3_READ_REDIRECT_TTL
               value: {{ .Values.readProxy.redirectTTL | quote }}
             {{- end }}
+            {{- with .Values.readProxy.trustedKeys }}
+            - name: NIKS3_TRUSTED_KEYS
+              value: {{ join " " . | quote }}
+            {{- end }}
+            {{- with .Values.readProxy.pullThrough }}
+            {{- with .upstreams }}
+            - name: NIKS3_PULL_THROUGH_UPSTREAMS
+              value: {{ join " " . | quote }}
+            {{- end }}
+            {{- if not (kindIs "invalid" .negativeTTL) }}
+            - name: NIKS3_PULL_THROUGH_NEGATIVE_TTL
+              value: {{ .negativeTTL | quote }}
+            {{- end }}
+            {{- if not (kindIs "invalid" .concurrency) }}
+            - name: NIKS3_PULL_THROUGH_CONCURRENCY
+              value: {{ .concurrency | quote }}
+            {{- end }}
+            {{- if not (kindIs "invalid" .narinfoConcurrency) }}
+            - name: NIKS3_PULL_THROUGH_NARINFO_CONCURRENCY
+              value: {{ .narinfoConcurrency | quote }}
+            {{- end }}
+            {{- end }}
             {{- end }}
             {{- if not (kindIs "invalid" .Values.maxNarSize) }}
             - name: NIKS3_MAX_NAR_SIZE
