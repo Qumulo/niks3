@@ -30,7 +30,8 @@ var zstdEncoderPool = sync.Pool{ //nolint:gochecknoglobals // sync.Pool should b
 
 // compressAndSimpleUploadNAR uploads a small NAR with a single presigned PUT.
 // The compressed NAR is stored as opaque bytes with no Content-Encoding (like multipart part upload);
-// nix-daemon decompresses it per the narinfo Compression field.
+// nix-daemon decompresses it per the narinfo Compression field. The Content-Type
+// is the one Nix's own binary cache stores use for NARs.
 func (c *Client) compressAndSimpleUploadNAR(ctx context.Context, storePath, presignedURL, objectKey string) (*NarListing, error) {
 	encoder, ok := zstdEncoderPool.Get().(*zstd.Encoder)
 	if !ok {
@@ -51,7 +52,9 @@ func (c *Client) compressAndSimpleUploadNAR(ctx context.Context, storePath, pres
 		return nil, fmt.Errorf("closing zstd encoder: %w", err)
 	}
 
-	if err := c.UploadBytesToPresignedURLWithHeaders(ctx, presignedURL, buf.Bytes(), nil); err != nil {
+	headers := map[string]string{headerContentType: contentTypeNar}
+
+	if err := c.UploadBytesToPresignedURLWithHeaders(ctx, presignedURL, buf.Bytes(), headers); err != nil {
 		return nil, fmt.Errorf("uploading NAR %s: %w", objectKey, err)
 	}
 

@@ -19,7 +19,7 @@ func (c *Client) UploadBytesToPresignedURLWithHeaders(ctx context.Context, presi
 	}
 
 	req.ContentLength = int64(len(data))
-	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set(headerContentType, "application/octet-stream")
 
 	// Add custom headers
 	for key, value := range headers {
@@ -45,8 +45,9 @@ func (c *Client) UploadListingToPresignedURL(ctx context.Context, presignedURL s
 		return fmt.Errorf("compressing listing: %w", err)
 	}
 
-	// Upload with Content-Encoding header
+	// Upload with Content-Encoding header and the Content-Type Nix uses for listings
 	headers := map[string]string{
+		headerContentType:  contentTypeJSON,
 		"Content-Encoding": compressionZstd,
 	}
 
@@ -112,7 +113,7 @@ func (c *Client) UploadBuildLogToPresignedURL(ctx context.Context, presignedURL 
 	}
 
 	// Set headers
-	req.Header.Set("Content-Type", "text/plain; charset=utf-8")
+	req.Header.Set(headerContentType, "text/plain; charset=utf-8")
 	req.Header.Set("Content-Encoding", compressionZstd)
 
 	// Upload

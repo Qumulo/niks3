@@ -50,9 +50,14 @@ func TestCompletedNarNotReofferedAcrossClosures(t *testing.T) {
 	// Upload and complete the NAR: the object now exists in S3.
 	handleMultipartUpload(ctx, t, narKey, nar, service)
 
-	// Confirm the NAR is really in S3.
-	if _, err := service.MinioClient.StatObject(ctx, service.Bucket, narKey, minio.StatObjectOptions{}); err != nil {
+	// Confirm the NAR is really in S3, with the type fixed at initiation.
+	info, err := service.MinioClient.StatObject(ctx, service.Bucket, narKey, minio.StatObjectOptions{})
+	if err != nil {
 		t.Fatalf("NAR should be present in S3 after completing its multipart upload: %v", err)
+	}
+
+	if info.ContentType != "application/x-nix-nar" {
+		t.Errorf("multipart NAR Content-Type = %q, want application/x-nix-nar", info.ContentType)
 	}
 
 	// Deliberately do NOT commit the first closure. A second closure referencing
