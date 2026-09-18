@@ -88,6 +88,9 @@ Only narinfos and NARs are filled; listings, logs and realisations still 404.
   buffer a 16 MiB multipart part. The cheap narinfo fills are bounded separately
   by `--pull-through-narinfo-concurrency` (default 256), so a nixpkgs bump does
   not queue behind large NARs.
+- With `--read-redirect-ttl`, the objects table decides whether a NAR read is
+  redirected to S3 or filled from upstream, so the hot path stays a local
+  database lookup with no S3 round trip.
 
 If clients list both caches as substituters, keep niks3's `--cache-priority`
 below cache.nixos.org's 40 (the default is 30), or Nix never asks niks3 first.

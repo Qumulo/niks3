@@ -267,7 +267,7 @@ func (s *Service) ReadProxyHandler(w http.ResponseWriter, r *http.Request) {
 	// Only NARs redirect: narinfos need decompressing here and the rest is
 	// too small to be worth an extra round trip.
 	if s.ReadRedirectTTL > 0 && narRe.MatchString(key) {
-		s.redirectToS3(w, r, key)
+		s.redirectOrPull(w, r, key)
 
 		return
 	}
