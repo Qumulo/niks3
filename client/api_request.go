@@ -35,7 +35,7 @@ func (c *Client) doJSONRequest(
 	}
 
 	if reqBody != nil {
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(headerContentType, "application/json")
 	}
 
 	resp, err := c.DoServerRequest(ctx, req)

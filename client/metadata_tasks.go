@@ -96,8 +96,9 @@ func (c *Client) uploadRealisation(ctx context.Context, task uploadTask, realisa
 		return fmt.Errorf("compressing realisation %s: %w", task.key, err)
 	}
 
-	// Upload with Content-Encoding header
+	// Upload with Content-Encoding header and the Content-Type Nix uses for realisations
 	headers := map[string]string{
+		headerContentType:  contentTypeJSON,
 		"Content-Encoding": compressionZstd,
 	}
 

@@ -125,3 +125,6 @@ func (s *Service) EnsureAbortUploadsRule(ctx context.Context) {
 func (s *Service) RefreshInventory(ctx context.Context) error {
 	return s.refreshInventory(ctx)
 }
+
+// ProxyContentType is an export of proxyContentType for tests.
+func ProxyContentType(key, reported string) string { return proxyContentType(key, reported) }
