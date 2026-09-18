@@ -65,24 +65,29 @@ flowchart LR
 
 With `--pull-through-upstream https://cache.nixos.org` the read proxy behaves
 like [nixos-passthru-cache](https://github.com/numtide/nixos-passthru-cache):
-a narinfo the bucket lacks is fetched from the upstream, streamed to the
-client and stored in the bucket, so the next reader is served from S3.
-Only narinfos are filled so far; NARs, listings, logs and realisations still 404.
+a narinfo or NAR the bucket lacks is fetched from the upstream, streamed to
+the client and stored in the bucket, so the next reader is served from S3.
+Only narinfos and NARs are filled; listings, logs and realisations still 404.
 
 - Upstream narinfos are stored byte for byte, so their signatures stay valid.
   niks3 does not re-sign them. Clients keep the upstream's key in
   `trusted-public-keys` alongside niks3's own.
 - `--trusted-key cache.nixos.org-1:...` refuses to serve or store
   narinfos that no listed key signed. The public keys of `--sign-key-path`
-  are always in the list, so pull-through needs one or the other.
+  are always in the list, so pull-through needs one or the other. NARs are
+  checked against the `FileHash` from their narinfo before they become
+  visible; what each narinfo said about its NAR is kept in the database, so
+  the check survives restarts. A NAR whose narinfo niks3 has not seen is
+  streamed to the client but not stored.
 - Pulled narinfos are tracked as *pull-through closures* that record the
   trusted signature they were verified with. They age and expire under the
   same GC `--older-than` as uploaded closures; reads do not refresh either.
 - Upstream 404s are remembered for `--pull-through-negative-ttl` (default 1m).
   Responses carry `X-Cache-Status: HIT`, `MISS` or `NEGATIVE`.
-- Narinfo fills are bounded by `--pull-through-narinfo-concurrency` (default
-  256); they are a few KiB each, so this bounds upstream connections rather
-  than memory.
+- `--pull-through-concurrency` (default 16) bounds NAR fills, each of which may
+  buffer a 16 MiB multipart part. The cheap narinfo fills are bounded separately
+  by `--pull-through-narinfo-concurrency` (default 256), so a nixpkgs bump does
+  not queue behind large NARs.
 
 If clients list both caches as substituters, keep niks3's `--cache-priority`
 below cache.nixos.org's 40 (the default is 30), or Nix never asks niks3 first.
