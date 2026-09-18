@@ -132,6 +132,7 @@ niks3 implements the [Nix binary cache specification](https://nixos.org/manual/n
 ### Operational Features
 
 - Authentication via API tokens (Bearer auth)
+- Client token sources: `--auth-token-path` (re-read periodically so an external refresher can rotate it) or `--auth-token-script` (a command printing `{"token":"...","expires_at":"RFC3339"}`, re-run before expiry); with neither flag the client falls back to `NIKS3_AUTH_TOKEN_FILE`, then `$XDG_CONFIG_HOME/niks3/auth-token`. The server URL can come from `NIKS3_SERVER_URL`.
 - OIDC authentication for CI/CD systems (GitHub Actions, GitLab CI)
 - S3 credentials via static keys (`--s3-access-key` / `--s3-secret-key`) or IAM (`--s3-use-iam` for IRSA, EC2 instance profiles, ECS task roles)
 - [Automatic upload](https://github.com/Mic92/niks3/wiki/Auto-Upload) via post-build-hook with crash-safe SQLite queue
