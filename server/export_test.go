@@ -30,6 +30,11 @@ func DeleteClosuresBefore(ctx context.Context, service *Service, cutoff time.Tim
 	return deleteClosuresBefore(ctx, service.Pool, cutoff)
 }
 
+// DeleteUntrustedPulledClosures exposes deleteUntrustedPulledClosures to tests.
+func DeleteUntrustedPulledClosures(ctx context.Context, service *Service, names []string) (int, error) {
+	return deleteUntrustedPulledClosures(ctx, service.Pool, names)
+}
+
 // GCAdvisoryLockKey exposes the GC advisory lock key to tests.
 const GCAdvisoryLockKey = gcAdvisoryLockKey
 

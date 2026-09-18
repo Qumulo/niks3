@@ -72,3 +72,64 @@ func TestDeleteClosuresRacingPins(t *testing.T) {
 		ok(t, err)
 	}
 }
+
+// The same holds when pulled closures expire because their key is no longer
+// trusted.
+func TestDeleteUntrustedPulledClosuresRacingPins(t *testing.T) {
+	t.Parallel()
+
+	service := createTestService(t)
+	defer service.Close()
+
+	ctx := t.Context()
+
+	const closures = 20000
+
+	for round := range 3 {
+		_, err := service.Pool.Exec(ctx, `INSERT INTO closures (key, updated_at, pulled_sig)
+			SELECT lpad(i::text, 32, '0') || '.narinfo', timezone('UTC', now()), 'dropped-1:sig'
+			FROM generate_series(1, $1::int) AS i`, closures)
+		ok(t, err)
+
+		var (
+			stop atomic.Bool
+			wg   sync.WaitGroup
+		)
+
+		for w := range 8 {
+			wg.Go(func() {
+				rng := rand.New(rand.NewPCG(uint64(round), uint64(w))) //nolint:gosec // test data
+
+				for !stop.Load() {
+					key := fmt.Sprintf("%032d.narinfo", 1+rng.IntN(closures))
+
+					tx, err := service.Pool.Begin(ctx)
+					if err != nil {
+						return
+					}
+
+					q := pg.New(tx)
+					if _, err := q.GetClosureForShare(ctx, key); err == nil {
+						_ = q.UpsertPin(ctx, pg.UpsertPinParams{Name: "pin" + key[:8], NarinfoKey: key, StorePath: "/nix/store/x"})
+					}
+
+					_ = tx.Commit(ctx)
+				}
+			})
+		}
+
+		time.Sleep(20 * time.Millisecond)
+
+		_, err = server.DeleteUntrustedPulledClosures(ctx, service, []string{"trusted-1"})
+
+		stop.Store(true)
+		wg.Wait()
+
+		if err != nil {
+			t.Fatalf("round %d: expiring untrusted pulled closures failed: %v", round, err)
+		}
+
+		_, err = service.Pool.Exec(ctx, `TRUNCATE pins, closures CASCADE`)
+		ok(t, err)
+	}
+}
