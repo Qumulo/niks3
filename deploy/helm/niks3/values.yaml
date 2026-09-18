@@ -1,6 +1,9 @@
 image:
-  repository: ghcr.io/mic92/niks3
-  tag: "" # defaults to appVersion
+  # Built by .github/workflows/build-image.yml from the same dated tag the
+  # chart is published with, so the default tag (the chart's appVersion)
+  # always names an image that exists.
+  repository: qcr.corp.qumulo.com/engineering/niks3
+  tag: "" # defaults to appVersion, the dated tag the chart was published with
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 replicaCount: 1
