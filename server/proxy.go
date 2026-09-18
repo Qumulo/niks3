@@ -320,7 +320,7 @@ func (s *Service) statOrPull(w http.ResponseWriter, r *http.Request, key string)
 	}
 
 	s.S3RateLimiter.RecordSuccess()
-	s.markProxyHit(w, key)
+	s.markProxyHit(w, r, key, &objInfo)
 
 	return objInfo, true
 }
