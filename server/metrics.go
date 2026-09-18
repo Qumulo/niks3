@@ -44,9 +44,10 @@ type Metrics struct {
 	commitDuration    prometheus.Histogram
 	commitObjects     prometheus.Counter
 
-	pullThroughRequests      *prometheus.CounterVec
-	pullThroughUpstreamBytes prometheus.Counter
-	pullThroughInFlight      prometheus.Gauge
+	pullThroughRequests        *prometheus.CounterVec
+	pullThroughUpstreamBytes   prometheus.Counter
+	pullThroughInFlight        prometheus.Gauge
+	pullThroughLiveCheckErrors prometheus.Counter
 }
 
 // NewMetrics builds a registry with the Go/process collectors and the cache
@@ -141,6 +142,10 @@ func NewMetrics() *Metrics {
 		pullThroughInFlight: factory.NewGauge(prometheus.GaugeOpts{
 			Name: "niks3_pull_through_in_flight",
 			Help: "Upstream fetches currently in progress.",
+		}),
+		pullThroughLiveCheckErrors: factory.NewCounter(prometheus.CounterOpts{
+			Name: "niks3_pull_through_live_check_errors_total",
+			Help: "Database errors while checking whether a NAR is tracked; each fell back to a blind presigned redirect.",
 		}),
 	}
 }
@@ -238,6 +243,14 @@ func (m *Metrics) pullThroughInFlightAdd(delta float64) {
 	}
 
 	m.pullThroughInFlight.Add(delta)
+}
+
+func (m *Metrics) recordPullThroughLiveCheckError() {
+	if m == nil {
+		return
+	}
+
+	m.pullThroughLiveCheckErrors.Inc()
 }
 
 // recordGC records the outcome of a garbage collection run.
