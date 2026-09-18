@@ -119,6 +119,7 @@ func (c *Client) RunGarbageCollection(ctx context.Context, olderThan string, fai
 				"phase", status.Phase,
 				"failed_uploads_deleted", status.Stats.FailedUploadsDeleted,
 				"old_closures_deleted", status.Stats.OldClosuresDeleted,
+				"pulled_closures_untrusted", status.Stats.PulledClosuresUntrusted,
 				"objects_marked", status.Stats.ObjectsMarkedForDeletion,
 				"objects_deleted", status.Stats.ObjectsDeletedAfterGracePeriod,
 				"objects_failed", status.Stats.ObjectsFailedToDelete,

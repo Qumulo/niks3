@@ -236,6 +236,18 @@ func (s *Service) runGarbageCollection(task *gcTask, age, pendingAge time.Durati
 	stats.OldClosuresDeleted = oldClosuresCount
 	task.updateStats(*stats)
 
+	if s.PullThrough != nil {
+		untrustedCount, err := s.cleanupUntrustedPulledClosures(ctx)
+		if err != nil {
+			task.fail(*stats, "failed to cleanup untrusted pulled closures: "+err.Error())
+
+			return
+		}
+
+		stats.PulledClosuresUntrusted = untrustedCount
+		task.updateStats(*stats)
+	}
+
 	task.setPhase(api.GCTaskPhaseCleanupOrphanObjects)
 
 	var gracePeriod int32
@@ -285,6 +297,7 @@ func (s *Service) runGarbageCollection(task *gcTask, age, pendingAge time.Durati
 		"Garbage collection completed",
 		"failed-uploads-deleted", stats.FailedUploadsDeleted,
 		"old-closures-deleted", stats.OldClosuresDeleted,
+		"pulled-closures-untrusted", stats.PulledClosuresUntrusted,
 		"objects-marked-for-deletion", stats.ObjectsMarkedForDeletion,
 		"objects-deleted-after-grace-period", stats.ObjectsDeletedAfterGracePeriod,
 		"objects-failed-to-delete", stats.ObjectsFailedToDelete,
