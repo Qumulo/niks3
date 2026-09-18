@@ -67,3 +67,6 @@ func ResolveDBConnectionString(flagValue, file string, lookupEnv func(string) (s
 func ServerTLSConfig(clientCA string) (*tls.Config, error) {
 	return serverTLSConfig(clientCA)
 }
+
+// ProxyContentType is an export of proxyContentType for tests.
+func ProxyContentType(key, reported string) string { return proxyContentType(key, reported) }
