@@ -5,7 +5,8 @@ on:
       - main
     tags:
       # Dated snapshot tags (e.g. 2026.09.04) pushed by
-      # Qumulo/repository-updater after each sync with upstream.
+      # Qumulo/repository-updater after each sync with upstream, and
+      # hand-pushed intra-day tags with a suffix (e.g. 2026.09.18-cb29049).
       - "2*.*.*"
   workflow_dispatch:
 concurrency:
@@ -65,8 +66,11 @@ jobs:
       - name: Push Helm chart
         # Only for dated tags: the chart version must be SemVer, so
         # 2026.09.04 becomes 2026.9.4 (leading zeros are not allowed) and
-        # the tag itself is kept as appVersion. The image tag in production
-        # is pinned separately, so a chart version need not match an image.
+        # the tag itself is kept as appVersion. A -<suffix> on the tag
+        # (2026.09.18-cb29049, for a second build on one day) is carried
+        # over as a SemVer prerelease: 2026.9.18-cb29049. The image tag in
+        # production is pinned separately, so a chart version need not
+        # match an image.
         if: startsWith(github.ref, 'refs/tags/')
         env:
           QCR_USERNAME: ${{ secrets.QCR_USERNAME }}
@@ -74,8 +78,10 @@ jobs:
         run: |
           set -xe
           PATH="$(nix build --inputs-from . nixpkgs#kubernetes-helm --print-out-paths --no-link)/bin:$PATH"
-          IFS=. read -r y m d <<< "${GITHUB_REF_NAME}"
-          VERSION="$((10#$y)).$((10#$m)).$((10#$d))"
+          date="${GITHUB_REF_NAME%%-*}"
+          suffix="${GITHUB_REF_NAME#"$date"}" # "" or "-<suffix>"
+          IFS=. read -r y m d <<< "$date"
+          VERSION="$((10#$y)).$((10#$m)).$((10#$d))${suffix}"
           helm registry login "$REGISTRY" -u "$QCR_USERNAME" --password-stdin <<< "$QCR_SECRET"
           helm package deploy/helm/niks3 --version "$VERSION" --app-version "${GITHUB_REF_NAME}" -d dist
           helm push "dist/niks3-${VERSION}.tgz" "$CHARTS"
