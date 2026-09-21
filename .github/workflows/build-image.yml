@@ -4,10 +4,10 @@ on:
     branches:
       - main
     tags:
-      # Dated snapshot tags (e.g. 2026.09.04) pushed by
-      # Qumulo/repository-updater after each sync with upstream, and
-      # hand-pushed intra-day tags with a suffix (e.g. 2026.09.18-cb29049).
-      - "2*.*.*"
+      # Build tags minted by bin/create-qumulo-tag.sh: the upstream release
+      # the branch is rebased onto, the number of Qumulo commits on top and
+      # the commit they end at, e.g. v1.11.0-qumulo-029-2cccc1d.
+      - "v[0-9]+.[0-9]+.[0-9]+-qumulo-[0-9]+-[0-9a-f]+"
   workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -64,13 +64,13 @@ jobs:
           regctl image import "ocidir://local:niks3" ./result
           regctl image copy "ocidir://local:niks3" "$IMAGE:${GITHUB_REF_NAME}"
       - name: Push Helm chart
-        # Only for dated tags: the chart version must be SemVer, so
-        # 2026.09.04 becomes 2026.9.4 (leading zeros are not allowed) and
-        # the tag itself is kept as appVersion. A -<suffix> on the tag
-        # (2026.09.18-cb29049, for a second build on one day) is carried
-        # over as a SemVer prerelease: 2026.9.18-cb29049. The image tag in
-        # production is pinned separately, so a chart version need not
-        # match an image.
+        # Only for build tags: the chart version is the tag without its
+        # leading v, so v1.11.0-qumulo-029-2cccc1d becomes chart
+        # 1.11.0-qumulo-029-2cccc1d, a SemVer prerelease of the upstream
+        # release it is built on (one alphanumeric identifier, compared as
+        # ASCII, which the zero-padded count keeps in order). The tag itself
+        # is kept as appVersion, which is also the image tag the chart
+        # defaults to. Helm and Flux both pin prerelease versions exactly.
         if: startsWith(github.ref, 'refs/tags/')
         env:
           QCR_USERNAME: ${{ secrets.QCR_USERNAME }}
@@ -78,10 +78,7 @@ jobs:
         run: |
           set -xe
           PATH="$(nix build --inputs-from . nixpkgs#kubernetes-helm --print-out-paths --no-link)/bin:$PATH"
-          date="${GITHUB_REF_NAME%%-*}"
-          suffix="${GITHUB_REF_NAME#"$date"}" # "" or "-<suffix>"
-          IFS=. read -r y m d <<< "$date"
-          VERSION="$((10#$y)).$((10#$m)).$((10#$d))${suffix}"
+          VERSION="${GITHUB_REF_NAME#v}"
           helm registry login "$REGISTRY" -u "$QCR_USERNAME" --password-stdin <<< "$QCR_SECRET"
           helm package deploy/helm/niks3 --version "$VERSION" --app-version "${GITHUB_REF_NAME}" -d dist
           helm push "dist/niks3-${VERSION}.tgz" "$CHARTS"
