@@ -97,7 +97,7 @@ For complete setup instructions, see the [Setup Guide](https://github.com/Mic92/
 
 ## Kubernetes
 
-Chart: `oci://ghcr.io/mic92/charts/niks3` (source in [`deploy/helm/niks3`](deploy/helm/niks3)), image: `ghcr.io/mic92/niks3`.
+Chart: `oci://qcr.corp.qumulo.com/engineering/charts/niks3` (source in [`deploy/helm/niks3`](deploy/helm/niks3)), image: `qcr.corp.qumulo.com/engineering/niks3`. Both are published from build tags of the form `v1.11.0-qumulo-029-2cccc1d`, minted by [`bin/create-qumulo-tag.sh`](bin/create-qumulo-tag.sh): the upstream release the fork's commits are rebased onto, how many of them there are, and the commit they end at. The image carries the tag as is; the chart version drops the `v` (`1.11.0-qumulo-029-2cccc1d`) and keeps the tag as appVersion. Upstream's are `oci://ghcr.io/mic92/charts/niks3` and `ghcr.io/mic92/niks3`.
 See the [Kubernetes](https://github.com/Mic92/niks3/wiki/Kubernetes) wiki page
 for Postgres/S3 wiring and letting pods push via their service account token.
 
