@@ -318,6 +318,83 @@ func TestReadProxyContentNegotiation(t *testing.T) {
 	}
 }
 
+// Some S3 implementations drop the stored Content-Encoding. A kind niks3
+// stores as zstd is then recognised by its magic and negotiated as if the
+// header had been kept; a plain one and a NAR go out as they are.
+func TestReadProxyContentNegotiationWithoutStoredEncoding(t *testing.T) {
+	t.Parallel()
+
+	service := createProxyTestService(t)
+	defer service.Close()
+
+	ctx := t.Context()
+
+	logKey := "log/r3sg474a7n33yk85gcda1031lfdvcrsh-mnw-0.12.2.drv"
+	logPlain := []byte("building...\n")
+	logZstd := zstdCompress(t, logPlain)
+	putTestObject(ctx, t, service, logKey, logZstd, minio.PutObjectOptions{ContentType: "text/plain"})
+
+	plainKey := "36xbg1ndr7hbcncrlf9nhx5is2b25d13.narinfo"
+	plainNarinfo := []byte("StorePath: /nix/store/abc-hello\n")
+	putTestObject(ctx, t, service, plainKey, plainNarinfo, minio.PutObjectOptions{})
+
+	narKey := "nar/1ngi2dxw1f7khrrjamzkkdai393lwcm8s78gvs1ag8k3n82w7bvp.nar.zst"
+	nar := zstdCompress(t, []byte("nar bytes"))
+	putTestObject(ctx, t, service, narKey, nar, minio.PutObjectOptions{})
+
+	ts := setupProxyServer(t, service)
+	defer ts.Close()
+
+	get := func(key, acceptEncoding, rng string) (int, http.Header, []byte) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/"+key, nil)
+		ok(t, err)
+
+		req.Header.Set("Accept-Encoding", acceptEncoding)
+
+		if rng != "" {
+			req.Header.Set("Range", rng)
+		}
+
+		resp, err := http.DefaultClient.Do(req)
+		ok(t, err)
+
+		body, err := io.ReadAll(resp.Body)
+		ok(t, err)
+		ok(t, resp.Body.Close())
+
+		return resp.StatusCode, resp.Header, body
+	}
+
+	for _, tc := range []struct {
+		key, acceptEncoding, rng string
+		wantEncoding             string
+		want                     []byte
+	}{
+		{logKey, "gzip", "", "", logPlain},
+		{logKey, "zstd", "", "zstd", logZstd},
+		// The encoding is only known once the body is read, so no Range applies.
+		{logKey, "gzip", "bytes=2-4", "", logPlain},
+		{plainKey, "gzip", "", "", plainNarinfo},
+		{plainKey, "zstd", "", "", plainNarinfo},
+		{narKey, "gzip", "", "", nar},
+	} {
+		status, header, body := get(tc.key, tc.acceptEncoding, tc.rng)
+		name := tc.key + " with " + tc.acceptEncoding + " " + tc.rng
+
+		if status != http.StatusOK {
+			t.Errorf("%s: status %d, want 200", name, status)
+		}
+
+		if got := header.Get("Content-Encoding"); got != tc.wantEncoding {
+			t.Errorf("%s: Content-Encoding = %q, want %q", name, got, tc.wantEncoding)
+		}
+
+		if !bytes.Equal(body, tc.want) {
+			t.Errorf("%s: body = %q, want %q", name, body, tc.want)
+		}
+	}
+}
+
 func TestReadProxyNarStreaming(t *testing.T) {
 	t.Parallel()
 

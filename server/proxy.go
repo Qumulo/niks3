@@ -1,6 +1,8 @@
 package server
 
 import (
+	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -32,6 +34,9 @@ const (
 	// write narinfos through presigned URLs, so a few kilobytes of zstd can
 	// expand to gigabytes. Real ones are a few hundred bytes.
 	maxNarinfoSize = 16 << 20
+
+	// zstdMagic starts every zstd frame.
+	zstdMagic = "\x28\xb5\x2f\xfd"
 )
 
 // ProxyWriteTimeout returns the per-request write deadline for streaming an
@@ -341,6 +346,11 @@ func (s *Service) handleProxyGet(w http.ResponseWriter, r *http.Request, key str
 		}
 	}
 
+	// Qumulo's S3 does not persist Content-Encoding (WULF-141), so an object
+	// niks3 stores as zstd can come back without it. Its encoding is then
+	// read from the body once the GET is open, and no Range applies.
+	sniff := objectContentEncoding(&objInfo) == "" && storedAsZstd(key)
+
 	decode := needsDecoding(r, &objInfo)
 
 	// Range support is for resuming large NAR downloads on flaky links. We
@@ -349,7 +359,7 @@ func (s *Service) handleProxyGet(w http.ResponseWriter, r *http.Request, key str
 	// and re-issues the underlying S3 stream.
 	var rng *byteRange
 
-	if !decode {
+	if !decode && !sniff {
 		var rangeErr error
 
 		rng, rangeErr = parseSingleRange(r.Header.Get("Range"), objInfo.Size)
@@ -399,10 +409,15 @@ func (s *Service) handleProxyGet(w http.ResponseWriter, r *http.Request, key str
 
 	s.S3RateLimiter.RecordSuccess()
 
+	var body io.Reader = obj
+	if sniff {
+		body, decode = sniffZstd(r, obj, &objInfo)
+	}
+
 	setProxyWriteDeadline(w, key, objInfo.Size)
 
 	if decode {
-		s.serveDecoded(w, r, obj, &objInfo)
+		s.serveDecoded(w, r, body, &objInfo)
 
 		return
 	}
@@ -419,7 +434,7 @@ func (s *Service) handleProxyGet(w http.ResponseWriter, r *http.Request, key str
 		w.WriteHeader(http.StatusOK)
 	}
 
-	if _, err := io.Copy(w, obj); err != nil {
+	if _, err := io.Copy(w, body); err != nil {
 		slog.Debug("Failed to stream S3 object to client", "key", key, "error", err)
 	}
 }
@@ -506,6 +521,31 @@ func acceptsZstd(r *http.Request) bool {
 	}
 
 	return false
+}
+
+// storedAsZstd reports whether key is a kind niks3 writes zstd-compressed
+// with a Content-Encoding: narinfos, listings, build logs and realisations.
+// NARs are compressed by Nix itself and served as they are.
+func storedAsZstd(key string) bool {
+	return narinfoRe.MatchString(key) || lsRe.MatchString(key) ||
+		logRe.MatchString(key) || realisationsRe.MatchString(key)
+}
+
+// sniffZstd records Content-Encoding zstd on info when obj starts with a
+// zstd frame. It returns the reader to continue from and whether the client
+// needs the body decoded.
+func sniffZstd(r *http.Request, obj io.Reader, info *minio.ObjectInfo) (io.Reader, bool) {
+	br := bufio.NewReader(obj)
+
+	if head, err := br.Peek(len(zstdMagic)); err == nil && bytes.Equal(head, []byte(zstdMagic)) {
+		if info.Metadata == nil {
+			info.Metadata = make(http.Header)
+		}
+
+		info.Metadata.Set("Content-Encoding", "zstd")
+	}
+
+	return br, needsDecoding(r, info)
 }
 
 // needsDecoding reports whether the object is stored as zstd and the client
