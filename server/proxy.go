@@ -260,7 +260,7 @@ func (s *Service) ReadProxyHandler(w http.ResponseWriter, r *http.Request) {
 	// Only NARs redirect: narinfos need decompressing here and the rest is
 	// too small to be worth an extra round trip.
 	if s.ReadRedirectTTL > 0 && narRe.MatchString(key) {
-		s.redirectToS3(w, r, key)
+		s.redirectOrPull(w, r, key)
 
 		return
 	}
@@ -303,15 +303,30 @@ func (s *Service) redirectToS3(w http.ResponseWriter, r *http.Request, key strin
 	http.Redirect(w, r, presigned.String(), http.StatusTemporaryRedirect)
 }
 
-func (s *Service) handleProxyHead(w http.ResponseWriter, r *http.Request, key string) {
+// statOrPull stats key in S3 and marks the hit. On a miss that
+// pull-through can fill, the fill answers the request; any other error is
+// reported. In both cases the response has been written and ok is false.
+func (s *Service) statOrPull(w http.ResponseWriter, r *http.Request, key string) (minio.ObjectInfo, bool) {
 	objInfo, err := s.MinioClient.StatObject(r.Context(), s.Bucket, key, minio.StatObjectOptions{})
 	if err != nil {
-		s.handleProxyS3Error(w, err, key)
+		if !s.pullThroughMiss(w, r, key, err) {
+			s.handleProxyS3Error(w, err, key)
+		}
 
-		return
+		return minio.ObjectInfo{}, false
 	}
 
 	s.S3RateLimiter.RecordSuccess()
+	s.markProxyHit(w, r, key, &objInfo)
+
+	return objInfo, true
+}
+
+func (s *Service) handleProxyHead(w http.ResponseWriter, r *http.Request, key string) {
+	objInfo, ok := s.statOrPull(w, r, key)
+	if !ok {
+		return
+	}
 
 	decode := setProxyHeaders(w, r, &objInfo)
 
@@ -327,14 +342,10 @@ func (s *Service) handleProxyHead(w http.ResponseWriter, r *http.Request, key st
 func (s *Service) handleProxyGet(w http.ResponseWriter, r *http.Request, key string) {
 	// First stat the object to get metadata and handle conditional requests
 	// before committing to a full GET.
-	objInfo, err := s.MinioClient.StatObject(r.Context(), s.Bucket, key, minio.StatObjectOptions{})
-	if err != nil {
-		s.handleProxyS3Error(w, err, key)
-
+	objInfo, ok := s.statOrPull(w, r, key)
+	if !ok {
 		return
 	}
-
-	s.S3RateLimiter.RecordSuccess()
 
 	// Handle conditional requests (If-None-Match)
 	if ifNoneMatch := r.Header.Get("If-None-Match"); ifNoneMatch != "" && ifNoneMatch == objInfo.ETag {
@@ -634,8 +645,7 @@ func (s *Service) handleProxyS3Error(w http.ResponseWriter, err error, key strin
 		return
 	}
 
-	errResp := minio.ToErrorResponse(err)
-	if errResp.Code == "NoSuchKey" || errResp.StatusCode == http.StatusNotFound {
+	if isNoSuchKey(err) {
 		http.NotFound(w, nil)
 
 		return
@@ -643,4 +653,11 @@ func (s *Service) handleProxyS3Error(w http.ResponseWriter, err error, key strin
 
 	slog.Error("S3 error during proxy", "key", key, "error", err)
 	http.Error(w, "Bad Gateway", http.StatusBadGateway)
+}
+
+// isNoSuchKey reports whether a minio error means the object does not exist.
+func isNoSuchKey(err error) bool {
+	errResp := minio.ToErrorResponse(err)
+
+	return errResp.Code == "NoSuchKey" || errResp.StatusCode == http.StatusNotFound
 }

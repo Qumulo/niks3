@@ -11,6 +11,7 @@ import (
 type Closure struct {
 	Key       string           `json:"key"`
 	UpdatedAt pgtype.Timestamp `json:"updated_at"`
+	PulledSig pgtype.Text      `json:"pulled_sig"`
 }
 
 type CommitReceipt struct {
@@ -65,4 +66,15 @@ type PublishClaim struct {
 	Key     string `json:"key"`
 	NarKey  string `json:"nar_key"`
 	Narinfo []byte `json:"narinfo"`
+}
+
+type PulledNar struct {
+	Key         string `json:"key"`
+	NarinfoKey  string `json:"narinfo_key"`
+	FileHash    string `json:"file_hash"`
+	FileSize    int64  `json:"file_size"`
+	NarSize     int64  `json:"nar_size"`
+	NarHash     string `json:"nar_hash"`
+	Compression string `json:"compression"`
+	Ca          string `json:"ca"`
 }
