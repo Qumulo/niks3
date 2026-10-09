@@ -191,6 +191,92 @@ DELETE FROM closures
 WHERE key = any($1::varchar [])
   AND key NOT IN (SELECT narinfo_key FROM pins);
 
+-- name: LockPulledClosuresNotSignedBy :many
+-- Lock the pull-through closures whose narinfo was verified by a key since
+-- dropped from the trusted set, for DeleteUnpinnedClosures to expire. Keys
+-- are matched by name, which is how Nix identifies them too: rotating a key
+-- means a new name (cache.nixos.org-1, -2), and a replacement key that
+-- reuses a name keeps what the old one vouched for. Pinned closures are
+-- kept, and ones a pin request is locking are skipped, as in LockOldClosures.
+SELECT c.key FROM closures AS c
+WHERE c.pulled_sig IS NOT NULL
+  AND split_part(c.pulled_sig, ':', 1) <> ALL($1::text [])
+  AND c.key NOT IN (SELECT narinfo_key FROM pins)
+ORDER BY c.key COLLATE "C"
+FOR UPDATE SKIP LOCKED;
+
+-- name: CountPinnedPulledClosuresNotSignedBy :one
+-- The pinned closures DeletePulledClosuresNotSignedBy would otherwise have
+-- expired, so the operator can be told a pin is holding one.
+SELECT count(*) FROM closures
+WHERE closures.pulled_sig IS NOT NULL
+  AND split_part(closures.pulled_sig, ':', 1) <> ALL($1::text [])
+  AND closures.key IN (SELECT narinfo_key FROM pins);
+
+-- name: UpsertPulledClosure :exec
+-- Root a pulled narinfo, recording the signature it was verified with. A
+-- re-fill records the latest verification. An existing upload closure for
+-- the same key is left untouched: it already keeps the object alive.
+INSERT INTO closures (key, updated_at, pulled_sig)
+VALUES ($1, timezone('UTC', now()), $2)
+ON CONFLICT (key) DO UPDATE SET updated_at = timezone('UTC', now()), pulled_sig = excluded.pulled_sig
+WHERE closures.pulled_sig IS NOT NULL;
+
+-- name: RegisterPulledObject :exec
+-- Record an object the read proxy filled from an upstream cache. A fill
+-- holds no pending row, so unlike RegisterCompletedObject it writes
+-- unconditionally. Conflict handling matches commit_pending_closure: merge
+-- refs, keep a known size, resurrect tombstones.
+INSERT INTO objects (key, refs, size)
+VALUES (sqlc.arg(key), sqlc.arg(refs)::varchar [], sqlc.arg(size))
+ON CONFLICT (key) DO UPDATE SET
+    refs = (
+        SELECT ARRAY(
+            SELECT DISTINCT unnest(objects.refs || excluded.refs)
+        )
+    ),
+    size = coalesce(objects.size, excluded.size),
+    deleted_at = NULL,
+    first_deleted_at = NULL;
+
+-- name: UpsertPulledNar :exec
+-- Remember what a pulled narinfo said about its NAR.
+INSERT INTO pulled_nars (key, narinfo_key, file_hash, file_size, nar_size)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (key) DO UPDATE SET
+    narinfo_key = excluded.narinfo_key,
+    file_hash = excluded.file_hash,
+    file_size = excluded.file_size,
+    nar_size = excluded.nar_size;
+
+-- name: GetPulledNar :one
+SELECT narinfo_key, file_hash, file_size, nar_size FROM pulled_nars
+WHERE key = $1;
+
+-- name: DeleteOrphanedPulledNars :execrows
+-- Drop NAR metadata whose narinfo is no longer tracked at all.
+DELETE FROM pulled_nars
+WHERE NOT EXISTS (
+    SELECT 1 FROM objects
+    WHERE objects.key = pulled_nars.narinfo_key
+);
+
+-- name: ObjectIsLive :one
+-- Whether the object is tracked and not tombstoned. The read proxy uses
+-- this instead of an S3 HEAD before redirecting NAR reads.
+SELECT EXISTS (
+    SELECT 1 FROM objects
+    WHERE key = $1 AND deleted_at IS NULL
+)::boolean AS live;
+
+-- name: ObjectIsTracked :one
+-- Whether the object has a row at all, tombstoned or not. The hit path
+-- adopts a tagged pull-through object that has none.
+SELECT EXISTS (
+    SELECT 1 FROM objects
+    WHERE key = $1
+)::boolean AS tracked;
+
 -- name: DeleteObjects :exec
 -- Drop the rows of objects GC removed from S3. A row that was resurrected
 -- in the meantime (a pull-through fill or an upload re-registered the key
