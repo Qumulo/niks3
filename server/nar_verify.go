@@ -18,6 +18,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/mikelolasagasti/xz"
@@ -54,6 +55,8 @@ var (
 	// Nix would: a compression or content address method it does not
 	// implement.
 	errNarUnverifiable = errors.New("pulled NAR cannot be verified")
+
+	errNarStringTooLong = errors.New("string is too long")
 )
 
 const (
@@ -66,6 +69,11 @@ const (
 	// narVerifyBuf is the read-ahead between the decompressor and the
 	// NAR parser.
 	narVerifyBuf = 64 << 10
+
+	// narVerifyBacklog is how far a streaming check may fall behind its
+	// writer: one S3 part, so the check keeps working while a fill waits
+	// on a part upload.
+	narVerifyBacklog = 16 << 20
 
 	// narZstdMaxWindow is the largest zstd window Nix decompresses with:
 	// libarchive streams through libzstd at its default limit,
@@ -380,6 +388,10 @@ func (p *narParser) parse() error {
 	// Nix reads the magic as a string of at most its own length and
 	// reports anything else, too long included, as not a NAR.
 	version, err := p.str(uint64(len(narVersionMagic)))
+	if err != nil && !errors.Is(err, errNarStringTooLong) {
+		return err
+	}
+
 	if err != nil || version != narVersionMagic {
 		return errors.New("input doesn't look like a Nix archive")
 	}
@@ -421,7 +433,7 @@ func (p *narParser) str(maxLen uint64) (string, error) {
 	}
 
 	if n > maxLen {
-		return "", errors.New("string is too long")
+		return "", errNarStringTooLong
 	}
 
 	buf := make([]byte, n)
@@ -607,23 +619,36 @@ func unexpectedEOF(err error) error {
 }
 
 // narVerifier checks a NAR file as it is written, so a fill can verify
-// what it streams without holding it. Writes block until the check has
-// taken them; the check keeps reading to the end whatever it finds, so
-// they never block for good.
+// what it streams without holding it. The check runs behind a queue of up
+// to narVerifyBacklog bytes, so it overlaps with the writer's other work
+// (the client, the S3 upload) instead of adding to it; a write blocks only
+// when the check is that far behind. The check keeps reading to the end
+// whatever it finds, so writes never block for good, and a check that
+// fails before the end says so at once (failure), so the writer can stop.
 type narVerifier struct {
-	pw   *io.PipeWriter
-	done chan error
+	queue  *byteQueue
+	done   chan error
+	failed chan struct{} // closed once early holds a verdict
+	early  error
 }
 
 func newNarVerifier(want narExpectation) *narVerifier {
-	pr, pw := io.Pipe()
-	v := &narVerifier{pw: pw, done: make(chan error, 1)}
+	v := &narVerifier{
+		queue:  newByteQueue(narVerifyBacklog),
+		done:   make(chan error, 1),
+		failed: make(chan struct{}),
+	}
 
 	go func() {
-		err := verifyNar(pr, want)
+		err := verifyNar(v.queue, want)
+		if err != nil {
+			v.early = err
+			close(v.failed)
+		}
+
 		// A check that failed early has stopped reading; drain the rest so
 		// the writer is not stuck.
-		_, _ = io.Copy(io.Discard, pr)
+		_, _ = io.Copy(io.Discard, v.queue)
 		v.done <- err
 	}()
 
@@ -631,17 +656,112 @@ func newNarVerifier(want narExpectation) *narVerifier {
 }
 
 func (v *narVerifier) Write(p []byte) (int, error) {
-	n, err := v.pw.Write(p)
-	if err != nil {
-		return n, fmt.Errorf("NAR verifier: %w", err)
-	}
+	return v.queue.Write(p)
+}
 
-	return n, nil
+// failure returns the check's error if it has already failed, without
+// waiting for it: nil means it has not failed so far.
+func (v *narVerifier) failure() error {
+	select {
+	case <-v.failed:
+		return v.early
+	default:
+		return nil
+	}
 }
 
 // finish ends the file and returns the verdict.
 func (v *narVerifier) finish() error {
-	_ = v.pw.Close()
+	v.queue.close(nil)
 
 	return <-v.done
+}
+
+// abort ends the check without a verdict, when the file could not be
+// read to its end.
+func (v *narVerifier) abort(err error) {
+	v.queue.close(err)
+	<-v.done //nolint:errcheck // no verdict is wanted
+}
+
+// byteQueue is a pipe with a buffer: writes copy into it and block only
+// while it holds max bytes or more.
+type byteQueue struct {
+	mu     sync.Mutex
+	cond   *sync.Cond
+	chunks [][]byte
+	size   int
+	max    int
+	closed bool
+	abort  error // what reads return at once after an aborting close
+}
+
+func newByteQueue(maxBytes int) *byteQueue {
+	q := &byteQueue{max: maxBytes}
+	q.cond = sync.NewCond(&q.mu)
+
+	return q
+}
+
+func (q *byteQueue) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	for q.size >= q.max && !q.closed {
+		q.cond.Wait()
+	}
+
+	if q.closed {
+		return 0, io.ErrClosedPipe
+	}
+
+	q.chunks = append(q.chunks, bytes.Clone(p))
+	q.size += len(p)
+	q.cond.Broadcast()
+
+	return len(p), nil
+}
+
+func (q *byteQueue) Read(p []byte) (int, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	for len(q.chunks) == 0 && !q.closed {
+		q.cond.Wait()
+	}
+
+	if q.abort != nil {
+		return 0, q.abort
+	}
+
+	if len(q.chunks) == 0 {
+		return 0, io.EOF
+	}
+
+	n := copy(p, q.chunks[0])
+	q.chunks[0] = q.chunks[0][n:]
+
+	if len(q.chunks[0]) == 0 {
+		q.chunks[0] = nil
+		q.chunks = q.chunks[1:]
+	}
+
+	q.size -= n
+	q.cond.Broadcast()
+
+	return n, nil
+}
+
+// close ends the queue. With a nil err, reads return what was written and
+// then io.EOF; otherwise they return err at once.
+func (q *byteQueue) close(err error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	q.closed, q.abort = true, err
+	q.cond.Broadcast()
 }

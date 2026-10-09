@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Mic92/niks3/api"
+	"github.com/Mic92/niks3/server/pg"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -231,6 +232,18 @@ func (s *Service) runGarbageCollection(task *gcTask, age, pendingAge time.Durati
 	stats.OldClosuresDeleted = oldClosuresCount
 	task.updateStats(*stats)
 
+	if s.PullThrough != nil {
+		untrustedCount, err := s.cleanupUntrustedPulledClosures(ctx)
+		if err != nil {
+			task.fail(*stats, "failed to cleanup untrusted pulled closures: "+err.Error())
+
+			return
+		}
+
+		stats.PulledClosuresUntrusted = untrustedCount
+		task.updateStats(*stats)
+	}
+
 	task.setPhase(api.GCTaskPhaseCleanupOrphanObjects)
 
 	var gracePeriod int32
@@ -267,10 +280,20 @@ func (s *Service) runGarbageCollection(task *gcTask, age, pendingAge time.Durati
 		return
 	}
 
+	// NAR metadata outlives its narinfo's objects row by at most one run.
+	if n, err := pg.New(s.Pool).DeleteOrphanedPulledNars(ctx); err != nil {
+		task.fail(*stats, "failed to cleanup pulled NAR metadata: "+err.Error())
+
+		return
+	} else if n > 0 {
+		slog.Info("Deleted orphaned pulled NAR metadata", "count", n)
+	}
+
 	slog.Info(
 		"Garbage collection completed",
 		"failed-uploads-deleted", stats.FailedUploadsDeleted,
 		"old-closures-deleted", stats.OldClosuresDeleted,
+		"pulled-closures-untrusted", stats.PulledClosuresUntrusted,
 		"objects-marked-for-deletion", stats.ObjectsMarkedForDeletion,
 		"objects-deleted-after-grace-period", stats.ObjectsDeletedAfterGracePeriod,
 		"objects-failed-to-delete", stats.ObjectsFailedToDelete,
@@ -346,7 +369,7 @@ func gcLockHeld(ctx context.Context, pool *pgxpool.Pool) (bool, error) {
 // This reclaims space from deleted rows and updates query planner statistics.
 // Failures are logged but don't cause the GC to fail.
 func (s *Service) vacuumGCTables(ctx context.Context) {
-	tables := []string{"pending_closures", "commit_receipts", "pending_objects", "multipart_uploads", "closures", "objects"}
+	tables := []string{"pending_closures", "commit_receipts", "pending_objects", "multipart_uploads", "closures", "objects", "pulled_nars"}
 	for _, table := range tables {
 		if _, err := s.Pool.Exec(ctx, "VACUUM ANALYZE "+table); err != nil {
 			// Log but don't fail - vacuum is nice to have but not critical

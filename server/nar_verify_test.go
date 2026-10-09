@@ -413,6 +413,17 @@ func TestVerifyNarStreaming(t *testing.T) {
 	garbage := bytes.Repeat([]byte{0xff}, 1<<20)
 	checkVerdict(t, server.VerifyNarStreaming(garbage, 4096, want), mismatch)
 
+	// A fill stops uploading a NAR as soon as its check fails, so the check
+	// must say so before the file ends; a file that is fine so far must
+	// not be reported.
+	if !server.NarVerifierFailsEarly(garbage, want) {
+		t.Error("a check that failed on the first bytes did not say so")
+	}
+
+	if server.NarVerifierFailsEarly(file[:len(file)/2], want) {
+		t.Error("a check reported failure before the file ended")
+	}
+
 	wrong := want
 	wrong.NarSize--
 	checkVerdict(t, server.VerifyNarStreaming(file, 4096, wrong), mismatch)

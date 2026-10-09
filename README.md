@@ -53,6 +53,56 @@ presigned S3 URL instead of being streamed, so NAR bytes bypass niks3. Narinfos
 and other metadata stay proxied. Note that anyone holding such a URL can fetch
 that object until it expires, regardless of read-proxy authentication.
 
+### Pull-through (optional)
+
+```mermaid
+flowchart LR
+    nix[Nix Client] -->|read request| niks3[niks3 Server]
+    niks3 -->|miss| upstream[(cache.nixos.org)]
+    niks3 -->|store + track| s3[(S3 Bucket)]
+    niks3 -->|stream| nix
+```
+
+With `--pull-through-upstream https://cache.nixos.org` the read proxy behaves
+like [nixos-passthru-cache](https://github.com/numtide/nixos-passthru-cache):
+a narinfo or NAR the bucket lacks is fetched from the upstream, streamed to
+the client and stored in the bucket, so the next reader is served from S3.
+Only narinfos and NARs are filled; listings, logs and realisations still 404.
+
+- Upstream narinfos are stored byte for byte, so their signatures stay valid.
+  niks3 does not re-sign them. Clients keep the upstream's key in
+  `trusted-public-keys` alongside niks3's own.
+- `--trusted-key cache.nixos.org-1:...` refuses to serve or store
+  narinfos that no listed key signed. The public keys of `--sign-key-path`
+  are always in the list, so pull-through needs one or the other. NARs are
+  checked against the `FileHash` from their narinfo before they become
+  visible; what each narinfo said about its NAR is kept in the database, so
+  the check survives restarts. A NAR whose narinfo niks3 has not seen is
+  streamed to the client but not stored.
+- Pulled narinfos are tracked as *pull-through closures* that record the
+  trusted signature they were verified with. They age and expire under the
+  same GC `--older-than` as uploaded closures; reads do not refresh either.
+  GC also expires pull-through closures signed by a key since removed from
+  the trusted list. Pinned closures are kept and reported.
+- Upstream 404s are remembered for `--pull-through-negative-ttl` (default 1m).
+  Responses carry `X-Cache-Status: HIT`, `MISS` or `NEGATIVE`.
+- Every object a fill writes is tagged with `x-amz-meta-niks3-pulled` (the
+  verifying signature on a narinfo, the narinfo key on a NAR). A tagged
+  object the database has no row for, which is what a registration that
+  failed after the S3 write leaves behind, is adopted on its next read:
+  re-verified against the trusted keys and rooted again. Untagged objects
+  are never adopted.
+- `--pull-through-concurrency` (default 16) bounds NAR fills, each of which may
+  buffer a 16 MiB multipart part. The cheap narinfo fills are bounded separately
+  by `--pull-through-narinfo-concurrency` (default 256), so a nixpkgs bump does
+  not queue behind large NARs.
+- With `--read-redirect-ttl`, the objects table decides whether a NAR read is
+  redirected to S3 or filled from upstream, so the hot path stays a local
+  database lookup with no S3 round trip.
+
+If clients list both caches as substituters, keep niks3's `--cache-priority`
+below cache.nixos.org's 40 (the default is 30), or Nix never asks niks3 first.
+
 ## Features
 
 ### Binary Cache Protocol Support

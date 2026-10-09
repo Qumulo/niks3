@@ -31,6 +31,11 @@ func DeleteClosuresBefore(ctx context.Context, service *Service, cutoff time.Tim
 	return deleteClosuresBefore(ctx, service.Pool, cutoff)
 }
 
+// DeleteUntrustedPulledClosures exposes deleteUntrustedPulledClosures to tests.
+func DeleteUntrustedPulledClosures(ctx context.Context, service *Service, names []string) (int, error) {
+	return deleteUntrustedPulledClosures(ctx, service.Pool, names)
+}
+
 // GCAdvisoryLockKey exposes the GC advisory lock key to tests.
 const GCAdvisoryLockKey = gcAdvisoryLockKey
 
@@ -180,8 +185,51 @@ func VerifyNarStreaming(file []byte, chunk int, want NarExpectation) error {
 	return v.finish()
 }
 
+// NarVerifierFailsEarly writes file to a narVerifier without finishing it
+// and reports whether the check says it failed within a second.
+func NarVerifierFailsEarly(file []byte, want NarExpectation) bool {
+	v := newNarVerifier(want.internal())
+	defer func() { _ = v.finish() }()
+
+	_, _ = v.Write(file)
+
+	for range 100 {
+		if v.failure() != nil {
+			return true
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	return false
+}
+
+// TrustedKeysWithSigning is an export of trustedKeysWithSigning for tests.
+func TrustedKeysWithSigning(configured []string, signingKeys []signing.Signer) ([]string, error) {
+	return trustedKeysWithSigning(configured, signingKeys)
+}
+
 // RequestWho is an export of requestWho for tests.
 func RequestWho(r *http.Request) string { return requestWho(r) }
 
 // ProxyContentType is an export of proxyContentType for tests.
 func ProxyContentType(key, reported string) string { return proxyContentType(key, reported) }
+
+// ForgetChecks clears the tracked-check debounce so a test can observe the
+// next check without waiting an hour.
+func (p *PullThrough) ForgetChecks() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	clear(p.checked)
+}
+
+// WaitChecks returns once every tracked check started so far has finished.
+func (p *PullThrough) WaitChecks() {
+	p.checks.Wait()
+}
+
+// SetIdleBudget shortens the idle budget of unknown-size transfers.
+func (p *PullThrough) SetIdleBudget(d time.Duration) {
+	p.idleBudget = d
+}
