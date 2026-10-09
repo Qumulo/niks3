@@ -29,24 +29,35 @@ type principal struct {
 	scopes []oidc.Scope
 	// pins are the reserved pin patterns this principal may write.
 	pins []string
+	// who names the credential, for attributing writes in the log:
+	// "oidc:<provider>:<subject>", "mtls:<subject DN>" or "api-token".
+	who string
 }
 
 type principalKey struct{}
 
 // adminPrincipal is the principal for mTLS clients and the static API token.
-func adminPrincipal() principal {
-	return principal{scopes: allScopes()}
+func adminPrincipal(who string) principal {
+	return principal{scopes: allScopes(), who: who}
+}
+
+// requestWho returns who authenticated r, or "" when its route let it
+// through without credentials.
+func requestWho(r *http.Request) string {
+	p, _ := r.Context().Value(principalKey{}).(principal)
+
+	return p.who
 }
 
 // authenticate returns the principal for r. The bool is false when no valid
 // credentials were presented at all.
 func (s *Service) authenticate(r *http.Request) (principal, bool) {
 	if s.mtlsCheck(r, s.MTLSBoundSubjects) {
-		return adminPrincipal(), true
+		return adminPrincipal(s.mtlsWho(r)), true
 	}
 
 	if len(s.MTLSBoundSubjectsRead) > 0 && s.mtlsCheck(r, s.MTLSBoundSubjectsRead) {
-		return principal{scopes: []oidc.Scope{oidc.ScopeRead}}, true
+		return principal{scopes: []oidc.Scope{oidc.ScopeRead}, who: s.mtlsWho(r)}, true
 	}
 
 	token, found := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
@@ -55,7 +66,7 @@ func (s *Service) authenticate(r *http.Request) (principal, bool) {
 	}
 
 	if s.APIToken != "" && subtle.ConstantTimeCompare([]byte(token), []byte(s.APIToken)) == 1 {
-		return adminPrincipal(), true
+		return adminPrincipal("api-token"), true
 	}
 
 	if s.OIDCValidator == nil {
@@ -82,7 +93,7 @@ func (s *Service) authenticate(r *http.Request) (principal, bool) {
 		scopes = append(slices.Clone(scopes), oidc.ScopeRead)
 	}
 
-	return principal{scopes: scopes, pins: claims.Pins}, true
+	return principal{scopes: scopes, pins: claims.Pins, who: "oidc:" + claims.Provider + ":" + claims.Subject}, true
 }
 
 // RequireScope wraps next so it only runs for principals holding scope.
