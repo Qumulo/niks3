@@ -59,7 +59,7 @@ jobs:
           QCR_SECRET: ${{ secrets.QCR_SECRET }}
         run: |
           set -xe
-          PATH="$(nix build --inputs-from . nixpkgs#regctl --print-out-paths --no-link)/bin:$PATH"
+          PATH="$(nix build .#niks3-docker.regctl --print-out-paths --no-link)/bin:$PATH"
           regctl registry login "$REGISTRY" -u "$QCR_USERNAME" --pass-stdin <<< "$QCR_SECRET"
           regctl image import "ocidir://local:niks3" ./result
           regctl image copy "ocidir://local:niks3" "$IMAGE:${GITHUB_REF_NAME}"
