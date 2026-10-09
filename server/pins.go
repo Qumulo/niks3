@@ -135,7 +135,7 @@ func (s *Service) CreatePinHandler(w http.ResponseWriter, r *http.Request) {
 
 	committed = true
 
-	slog.Info("Created/updated pin", "name", name, "store_path", req.StorePath, "narinfo_key", narinfoKey)
+	slog.Info("Created/updated pin", "name", name, "store_path", req.StorePath, "narinfo_key", narinfoKey, "by", requestWho(r))
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -214,7 +214,7 @@ func (s *Service) DeletePinHandler(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("Failed to delete pin from S3", "key", pinKey, "error", err)
 	}
 
-	slog.Info("Deleted pin", "name", name)
+	slog.Info("Deleted pin", "name", name, "by", requestWho(r))
 	w.WriteHeader(http.StatusNoContent)
 }
 
