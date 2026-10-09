@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/Mic92/niks3/server"
 	"github.com/Mic92/niks3/server/oidc"
 	"github.com/Mic92/niks3/server/oidc/oidctest"
 	"github.com/golang-jwt/jwt/v5"
@@ -449,4 +450,62 @@ func TestService_ReadScope_PublicByDefault(t *testing.T) {
 		path:    "/health",
 		handler: service.RequireScope(oidc.ScopeRead, service.HealthCheckHandler),
 	})
+}
+
+func TestService_RequireScope_Who(t *testing.T) {
+	t.Parallel()
+
+	m := oidctest.StartMockOIDC(t)
+	_, validator := oidctest.NewValidator(t, oidc.Config{
+		AllowInsecure: true,
+		Providers: map[string]*oidc.ProviderConfig{
+			"test": {
+				Issuer:   m.Issuer(),
+				Audience: m.ClientID,
+				Rules:    []oidc.Rule{{BoundSubject: []string{"builder"}, Scopes: []oidc.Scope{oidc.ScopeWrite}}},
+			},
+		},
+	})
+
+	service := createTestService(t)
+	t.Cleanup(service.Close)
+	service.Pool.Close()
+	service.OIDCValidator = validator
+	service.APIToken = "static-api-token-at-least-36-chars-long"
+	service.MTLSProxyHeader = "X-SSL-Client-Verify"
+	service.MTLSSubjectHeader = "X-SSL-Client-Dn"
+	service.MTLSBoundSubjects = []string{"CN=admin"}
+
+	cases := []struct {
+		name   string
+		header map[string]string
+		want   string
+	}{
+		{"oidc", map[string]string{"Authorization": "Bearer " + oidctest.SignToken(t, m, jwt.MapClaims{"sub": "builder"})}, "oidc:test:builder"},
+		{"static token", map[string]string{"Authorization": "Bearer " + service.APIToken}, "api-token"},
+		{"mtls", map[string]string{"X-SSL-Client-Verify": "SUCCESS", "X-SSL-Client-Dn": "CN=admin"}, "mtls:CN=admin"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var got string
+
+			testRequest(t, &TestRequest{
+				method: "GET",
+				path:   "/health",
+				handler: service.RequireScope(oidc.ScopeWrite, func(w http.ResponseWriter, r *http.Request) {
+					got = server.RequestWho(r)
+
+					w.WriteHeader(http.StatusOK)
+				}),
+				header: tc.header,
+			})
+
+			if got != tc.want {
+				t.Errorf("who = %q, want %q", got, tc.want)
+			}
+		})
+	}
 }

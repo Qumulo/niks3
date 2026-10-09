@@ -95,3 +95,10 @@ func (s *Service) mtlsSubject(r *http.Request) (string, bool) {
 
 	return r.Header.Get(s.MTLSSubjectHeader), true
 }
+
+// mtlsWho is a principal's who for a request mtlsCheck accepted.
+func (s *Service) mtlsWho(r *http.Request) string {
+	subject, _ := s.mtlsSubject(r)
+
+	return "mtls:" + subject
+}

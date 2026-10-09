@@ -77,6 +77,12 @@ func (s *Service) CreatePushHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// One line per root names who pushed it, as for a single closure.
+	who := requestWho(r)
+	for _, root := range req.Roots {
+		slog.Info("Started upload", "closure", root, "id", push.ID, "by", who)
+	}
+
 	writeJSONResponse(w, push)
 }
 
