@@ -192,8 +192,13 @@ WHERE key = any($1::varchar [])
   AND key NOT IN (SELECT narinfo_key FROM pins);
 
 -- name: DeleteObjects :exec
+-- Drop the rows of objects GC removed from S3. A row that was resurrected
+-- in the meantime (a pull-through fill or an upload re-registered the key
+-- between the S3 delete and this batched flush) is left alone: its new
+-- object is tracked, and untracking it would leak it in the bucket.
 DELETE FROM objects
-WHERE key = any($1::varchar []);
+WHERE key = any($1::varchar [])
+  AND deleted_at IS NOT NULL;
 
 -- name: InsertMultipartUpload :exec
 INSERT INTO multipart_uploads (pending_closure_id, object_key, upload_id)

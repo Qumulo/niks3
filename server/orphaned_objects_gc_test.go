@@ -505,3 +505,62 @@ func TestOrphanedObjectsGCStressTest(t *testing.T) {
 	t.Logf("  - Objects deleted: %d", len(deletedKeys))
 	t.Logf("  - Total GC'd: %d", len(objsToDelete))
 }
+
+// GC removes objects from S3 as it goes and flushes the matching rows in
+// batches of a thousand, so a row can be resurrected in between by a writer
+// that holds no pending row for the key, as a read proxy filling the bucket
+// from an upstream cache does. That row tracks a new object, and the flush
+// must leave it alone; untracking it would leak the object in the bucket.
+func TestGCRowFlushKeepsResurrectedObjects(t *testing.T) {
+	t.Parallel()
+
+	service := createTestService(t)
+	defer service.Close()
+
+	ctx := t.Context()
+	queries := pg.New(service.Pool)
+
+	hash := "flushtest11111111111111111111111"
+	createTestClosure(t, service, queries, hash)
+
+	narinfoKey := hash + ".narinfo"
+	narKey := "nar/" + hash + ".nar.zst"
+
+	// The closure expires and GC tombstones both objects.
+	time.Sleep(10 * time.Millisecond)
+
+	_, err := server.DeleteClosuresBefore(ctx, service, time.Now().UTC().Add(time.Second))
+	ok(t, err)
+
+	marked, err := queries.MarkStaleObjects(ctx)
+	ok(t, err)
+
+	if marked < 2 {
+		t.Fatalf("marked %d objects, want both", marked)
+	}
+
+	// GC has removed both from S3. Before it flushes the rows, the NAR is
+	// written and registered again.
+	_, err = service.Pool.Exec(ctx, "UPDATE objects SET deleted_at = NULL, first_deleted_at = NULL WHERE key = $1", narKey)
+	ok(t, err)
+
+	ok(t, queries.DeleteObjects(ctx, []string{narinfoKey, narKey}))
+
+	var found bool
+
+	err = service.Pool.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM objects WHERE key = $1)", narinfoKey).Scan(&found)
+	ok(t, err)
+
+	if found {
+		t.Error("the still-tombstoned narinfo row survived the flush")
+	}
+
+	var live bool
+
+	err = service.Pool.QueryRow(ctx, "SELECT deleted_at IS NULL FROM objects WHERE key = $1", narKey).Scan(&live)
+	ok(t, err)
+
+	if !live {
+		t.Error("the re-registered NAR row is not live after the flush")
+	}
+}
