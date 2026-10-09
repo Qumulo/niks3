@@ -144,6 +144,10 @@ func (s *Service) CreatePendingClosureHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	// One line per closure names who pushed it; per-request auth logging
+	// is at debug because a push makes dozens of requests per path.
+	slog.Info("Started upload", "closure", *req.Closure, "id", upload.ID, "by", requestWho(r))
+
 	writeJSONResponse(w, upload)
 }
 

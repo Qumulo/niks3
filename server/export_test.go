@@ -99,6 +99,9 @@ func TrustedKeysWithSigning(configured []string, signingKeys []*signing.Key) ([]
 	return trustedKeysWithSigning(configured, signingKeys)
 }
 
+// RequestWho is an export of requestWho for tests.
+func RequestWho(r *http.Request) string { return requestWho(r) }
+
 // ProxyContentType is an export of proxyContentType for tests.
 func ProxyContentType(key, reported string) string { return proxyContentType(key, reported) }
 
