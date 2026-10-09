@@ -25,7 +25,9 @@ BEGIN
     INSERT INTO closures (updated_at, key)
     VALUES (now, closure_key)
     ON CONFLICT (key)
-    DO UPDATE SET updated_at = now;
+    -- A native upload of a path the read proxy pulled earlier takes over
+    -- the root: it is no longer subject to the trusted-key expiry.
+    DO UPDATE SET updated_at = now, pulled_sig = NULL;
 
     -- Commit the pending objects. Byte order avoids deadlocks and is faster.
     INSERT INTO objects (key, refs, size)
