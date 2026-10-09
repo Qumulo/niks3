@@ -122,5 +122,8 @@ func (s *Service) EnsureAbortUploadsRule(ctx context.Context) {
 	s.ensureAbortUploadsRule(ctx)
 }
 
+// RequestWho is an export of requestWho for tests.
+func RequestWho(r *http.Request) string { return requestWho(r) }
+
 // ProxyContentType is an export of proxyContentType for tests.
 func ProxyContentType(key, reported string) string { return proxyContentType(key, reported) }
