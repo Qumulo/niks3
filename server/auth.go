@@ -29,13 +29,24 @@ type principal struct {
 	scopes []oidc.Scope
 	// pins are the reserved pin patterns this principal may write.
 	pins []string
+	// who names the credential, for attributing writes in the log:
+	// "oidc:<provider>:<subject>", "mtls:<subject DN>" or "api-token".
+	who string
 }
 
 type principalKey struct{}
 
 // adminPrincipal is the principal for mTLS clients and the static API token.
-func adminPrincipal() principal {
-	return principal{scopes: allScopes()}
+func adminPrincipal(who string) principal {
+	return principal{scopes: allScopes(), who: who}
+}
+
+// requestWho returns who authenticated r, or "" when its route let it
+// through without credentials.
+func requestWho(r *http.Request) string {
+	p, _ := r.Context().Value(principalKey{}).(principal)
+
+	return p.who
 }
 
 var errUnauthorized = errors.New("unauthorized")
@@ -43,11 +54,11 @@ var errUnauthorized = errors.New("unauthorized")
 // authenticate returns the principal for r.
 func (s *Service) authenticate(r *http.Request) (principal, error) {
 	if s.mtlsCheck(r, s.MTLSBoundSubjects) {
-		return adminPrincipal(), nil
+		return adminPrincipal(s.mtlsWho(r)), nil
 	}
 
 	if len(s.MTLSBoundSubjectsRead) > 0 && s.mtlsCheck(r, s.MTLSBoundSubjectsRead) {
-		return principal{scopes: []oidc.Scope{oidc.ScopeRead}}, nil
+		return principal{scopes: []oidc.Scope{oidc.ScopeRead}, who: s.mtlsWho(r)}, nil
 	}
 
 	token := requestToken(r)
@@ -56,7 +67,7 @@ func (s *Service) authenticate(r *http.Request) (principal, error) {
 	}
 
 	if s.APIToken != "" && subtle.ConstantTimeCompare([]byte(token), []byte(s.APIToken)) == 1 {
-		return adminPrincipal(), nil
+		return adminPrincipal("api-token"), nil
 	}
 
 	if s.OIDCValidator == nil {
@@ -89,7 +100,7 @@ func (s *Service) authenticate(r *http.Request) (principal, error) {
 		scopes = append(slices.Clone(scopes), oidc.ScopeRead)
 	}
 
-	return principal{scopes: scopes, pins: claims.Pins}, nil
+	return principal{scopes: scopes, pins: claims.Pins, who: "oidc:" + claims.Provider + ":" + claims.Subject}, nil
 }
 
 // RequireScope wraps next so it only runs for principals holding scope.
