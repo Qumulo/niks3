@@ -169,6 +169,7 @@ func PrepareClosures(ctx context.Context, topLevelPaths []string, pathInfos map[
 		}
 
 		// Narinfo references both dependencies, its own NAR file, .ls file, and any realisations
+		// (and its build log, added below)
 		narinfoRefs := make([]string, 0, len(references)+2+len(realisationKeys))
 		narinfoRefs = append(narinfoRefs, references...)
 		narinfoRefs = append(narinfoRefs, narKey, lsKey)
@@ -213,6 +214,9 @@ func PrepareClosures(ctx context.Context, topLevelPaths []string, pathInfos map[
 					Type: ObjectTypeBuildLog,
 					Refs: []string{}, // Logs don't reference anything
 				})
+
+				// Nothing else references the log, so without this GC sweeps it as an orphan.
+				objects[0].Refs = append(objects[0].Refs, logKey)
 
 				// Track the log path for later upload
 				logPathsByKey[logKey] = logPath
