@@ -633,6 +633,90 @@ func TestClientWithDependencies(t *testing.T) {
 	testRetrieveWithNixCopy(ctx, t, testService, storePath, nixEnv)
 }
 
+// Regression test: build logs were pushed with nothing referencing them, so
+// GC swept every one as an orphan and `nix log` only worked until its next run.
+func TestBuildLogSurvivesGC(t *testing.T) {
+	t.Parallel()
+
+	testService := createTestServiceWithAuth(t, testAuthToken)
+	t.Cleanup(func() { testService.Close() })
+
+	err := testService.InitializeBucket(t.Context())
+	ok(t, err)
+
+	mux := http.NewServeMux()
+	registerTestHandlers(mux, testService)
+	mux.HandleFunc("DELETE /api/closures", testService.RequireScope(oidc.ScopeWrite, testService.CleanupClosuresOlder))
+	mux.HandleFunc("GET /api/gc/status", testService.RequireScope(oidc.ScopeWrite, testService.GCStatusHandler))
+
+	ts := httptest.NewServer(mux)
+
+	t.Cleanup(func() { ts.Close() })
+
+	ctx := t.Context()
+	nixEnv := setupIsolatedNixStore(t)
+
+	nixExpr := filepath.Join(t.TempDir(), "logged.nix")
+	err = os.WriteFile(nixExpr, []byte(`
+	derivation {
+		name = "logged";
+		system = builtins.currentSystem;
+		builder = "/bin/sh";
+		args = [ "-c" "echo 'build log line'; echo done > $out" ];
+	}
+	`), 0o600)
+	ok(t, err)
+
+	cmd := exec.CommandContext(ctx, "nix-build", nixExpr, "--no-out-link")
+	cmd.Env = nixEnv
+
+	output, err := cmd.Output()
+	if err != nil {
+		t.Skipf("Failed to build nix expression (nix environment not set up): %v", err)
+	}
+
+	storePath := strings.TrimSpace(string(output))
+
+	cmd = exec.CommandContext(ctx, "nix-store", "--query", "--deriver", storePath)
+	cmd.Env = nixEnv
+
+	output, err = cmd.Output()
+	ok(t, err)
+
+	logKey := "log/" + filepath.Base(strings.TrimSpace(string(output)))
+
+	err = pushToServer(ctx, ts.URL, testAuthToken, []string{storePath}, nixEnv)
+	ok(t, err)
+
+	liveObjects := func(key string) int {
+		var n int
+
+		ok(t, testService.Pool.QueryRow(ctx,
+			"SELECT COUNT(*) FROM objects WHERE key = $1 AND deleted_at IS NULL", key).Scan(&n))
+
+		return n
+	}
+
+	if liveObjects(logKey) != 1 {
+		t.Fatalf("push did not upload %s", logKey)
+	}
+
+	c, err := client.NewClient(ctx, ts.URL, testAuthToken)
+	ok(t, err)
+
+	// The closure is younger than an hour and stays; force deletes whatever
+	// it does not reach without waiting out the grace period.
+	_, err = c.RunGarbageCollection(ctx, "1h", "0s", true)
+	ok(t, err)
+
+	if liveObjects(logKey) != 1 {
+		t.Fatalf("GC deleted %s while its closure is still live", logKey)
+	}
+
+	_, err = testService.MinioClient.StatObject(ctx, testService.Bucket, logKey, minio.StatObjectOptions{})
+	ok(t, err)
+}
+
 func nixEvalStorePath(t *testing.T, nixEnv []string, expr string) string {
 	t.Helper()
 
