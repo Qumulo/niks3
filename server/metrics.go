@@ -48,6 +48,7 @@ type Metrics struct {
 	pullThroughUpstreamBytes   prometheus.Counter
 	pullThroughInFlight        prometheus.Gauge
 	pullThroughLiveCheckErrors prometheus.Counter
+	readRedirects              *prometheus.CounterVec
 }
 
 // NewMetrics builds a registry with the Go/process collectors and the cache
@@ -147,6 +148,10 @@ func NewMetrics() *Metrics {
 			Name: "niks3_pull_through_live_check_errors_total",
 			Help: "Database errors while checking whether a NAR is tracked; each fell back to a blind presigned redirect.",
 		}),
+		readRedirects: factory.NewCounterVec(prometheus.CounterOpts{
+			Name: "niks3_read_redirects_total",
+			Help: "NAR reads redirected to presigned S3 URLs, by the endpoint signing them: primary, or a redirect route's host[:port].",
+		}, []string{"endpoint"}),
 	}
 }
 
@@ -251,6 +256,14 @@ func (m *Metrics) recordPullThroughLiveCheckError() {
 	}
 
 	m.pullThroughLiveCheckErrors.Inc()
+}
+
+func (m *Metrics) recordReadRedirect(endpoint string) {
+	if m == nil {
+		return
+	}
+
+	m.readRedirects.WithLabelValues(endpoint).Inc()
 }
 
 // recordGC records the outcome of a garbage collection run.
