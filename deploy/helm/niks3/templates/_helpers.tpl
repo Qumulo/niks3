@@ -75,6 +75,22 @@ app.kubernetes.io/component: server
 {{- if $providers }}{{ toJson (dict "providers" $providers) }}{{- end }}
 {{- end }}
 
+{{/* JSON list for --read-redirect-routes; empty when no route is set. */}}
+{{- define "niks3.redirectRoutes" -}}
+{{- $routes := list }}
+{{- range $i, $route := .Values.readProxy.redirectRoutes }}
+{{- $dir := printf "/secrets/redirect-routes/%d" $i }}
+{{- $routes = append $routes (dict
+  "cidrs" (required "readProxy.redirectRoutes[].cidrs is required" $route.cidrs)
+  "s3_url" (required "readProxy.redirectRoutes[].s3URL is required" $route.s3URL)
+  "bucket" ($route.bucket | default "")
+  "region" ($route.region | default "")
+  "access_key_path" (printf "%s/access-key" $dir)
+  "secret_key_path" (printf "%s/secret-key" $dir)) }}
+{{- end }}
+{{- if $routes }}{{ toJson $routes }}{{- end }}
+{{- end }}
+
 {{- define "niks3.s3SecretName" -}}
 {{- if not (or .Values.s3.existingSecret .Values.s3.accessKey) }}
 {{- fail "set s3.useIAM, s3.existingSecret or s3.accessKey/secretKey" }}

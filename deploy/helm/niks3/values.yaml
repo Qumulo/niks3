@@ -57,6 +57,29 @@ cacheURL: ""
 readProxy:
   enabled: false
   redirectTTL: null # e.g. 15m
+  # Send the NAR redirects of clients in `cidrs` to another S3 endpoint that
+  # serves the same objects under the same keys, such as a read-only replica
+  # of the bucket nearer to them (requires redirectTTL). The first route
+  # holding the client wins; other clients get s3.publicURL or s3.endpoint.
+  # existingSecret holds the endpoint's `access-key` and `secret-key`, which
+  # only sign redirects and so need only read access. The endpoint must serve
+  # an object as soon as the primary does (a Qumulo portal of the bucket's
+  # directory does); one that copies asynchronously 404s fresh NARs until it
+  # catches up, and Nix fails those substitutions.
+  redirectRoutes: []
+  # - cidrs: ["198.51.100.0/24"]
+  #   s3URL: https://replica.example.com:9000
+  #   bucket: "" # defaults to s3.bucket
+  #   region: "" # defaults to the primary bucket's region
+  #   existingSecret: niks3-replica-s3
+  # CIDRs of the ingress controller's pods. Their X-Forwarded-For names the
+  # client a redirect route is matched against; without them every client
+  # looks like the ingress controller. The ingress Service needs
+  # `externalTrafficPolicy: Local` (or PROXY protocol): with `Cluster`,
+  # kube-proxy rewrites the source address, X-Forwarded-For holds a node IP,
+  # and no route ever matches. niks3_read_redirects_total shows which
+  # endpoint redirects go to.
+  trustedProxies: []
   # Keys one of which must have signed an upstream narinfo for it to be
   # served and stored. The public keys of signing.keys are always trusted.
   trustedKeys: [] # e.g. ["cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="]

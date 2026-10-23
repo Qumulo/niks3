@@ -162,6 +162,45 @@
             "null"
           ]
         },
+        "redirectRoutes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "cidrs",
+              "s3URL",
+              "existingSecret"
+            ],
+            "properties": {
+              "cidrs": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string"
+                }
+              },
+              "s3URL": {
+                "type": "string"
+              },
+              "bucket": {
+                "type": "string"
+              },
+              "region": {
+                "type": "string"
+              },
+              "existingSecret": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "trustedProxies": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "trustedKeys": {
           "type": "array",
           "items": {
