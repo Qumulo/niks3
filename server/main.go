@@ -141,7 +141,15 @@ func (s *stringSliceFlag) Set(value string) error {
 }
 
 func validateReadRedirect(opts *options) error {
+	if len(opts.TrustedProxies) > 0 && opts.ReadRedirectRoutesPath == "" {
+		return errors.New("--trusted-proxy is only used by --read-redirect-routes")
+	}
+
 	if opts.ReadRedirectTTL == 0 {
+		if opts.ReadRedirectRoutesPath != "" {
+			return errors.New("--read-redirect-routes requires --read-redirect-ttl")
+		}
+
 		return nil
 	}
 
@@ -311,6 +319,18 @@ func parseArgs() (*options, error) { //nolint:maintidx // one flat list of flags
 		getEnvOrDefaultDuration("NIKS3_READ_REDIRECT_TTL", 0),
 		"Answer NAR reads with a redirect to a presigned S3 URL valid for this long (e.g. 15m) instead of "+
 			"streaming them. Requires --enable-read-proxy. 0 disables")
+	flag.StringVar(&opts.ReadRedirectRoutesPath, "read-redirect-routes",
+		getEnvOrDefault("NIKS3_READ_REDIRECT_ROUTES", ""),
+		"Path to a JSON list of routes that redirect the NAR reads of clients in given CIDRs to another S3 "+
+			"endpoint serving the same objects, each with its own read-only keys. Requires --read-redirect-ttl")
+	trustedProxies := (*stringSliceFlag)(&opts.TrustedProxies)
+	for p := range strings.FieldsSeq(getEnvOrDefault("NIKS3_TRUSTED_PROXIES", "")) {
+		_ = trustedProxies.Set(p)
+	}
+
+	flag.Var(trustedProxies, "trusted-proxy",
+		"CIDR of a reverse proxy whose X-Forwarded-For names the client when matching --read-redirect-routes. "+
+			"Repeat for multiple. NIKS3_TRUSTED_PROXIES takes a space-separated list")
 
 	pullThroughFlags(&opts)
 	flag.BoolVar(&opts.Debug, "debug", getEnvOrDefaultBool("NIKS3_DEBUG", false),

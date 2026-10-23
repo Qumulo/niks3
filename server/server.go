@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
@@ -57,6 +58,14 @@ type options struct {
 	// ReadRedirectTTL > 0 redirects NAR reads to presigned S3 URLs with this
 	// lifetime instead of streaming them. Requires EnableReadProxy.
 	ReadRedirectTTL time.Duration
+
+	// ReadRedirectRoutesPath names a JSON list of RedirectRouteConfig.
+	// Requires ReadRedirectTTL.
+	ReadRedirectRoutesPath string
+
+	// TrustedProxies are CIDRs of reverse proxies whose X-Forwarded-For
+	// is believed when matching a client to a redirect route.
+	TrustedProxies []string
 
 	// PullThrough, when it has upstreams, makes the read proxy fill the
 	// bucket from those caches on a miss. Requires EnableReadProxy.
@@ -133,6 +142,14 @@ type Service struct {
 
 	// See options.ReadRedirectTTL.
 	ReadRedirectTTL time.Duration
+
+	// RedirectRoutes send the NAR redirects of clients in their networks
+	// to other S3 endpoints; any other client gets PresignClient's.
+	RedirectRoutes []RedirectRoute
+
+	// TrustedProxies are the networks of reverse proxies whose
+	// X-Forwarded-For says which client a request came from.
+	TrustedProxies []netip.Prefix
 
 	// PullThrough is nil unless upstream fills are enabled.
 	PullThrough *PullThrough
@@ -221,9 +238,9 @@ func NewPresignClient(
 	publicURL, bucket, region string,
 	lookup minio.BucketLookupType,
 ) (*minio.Client, error) {
-	u, err := url.Parse(publicURL)
-	if err != nil || u.Host == "" || (u.Scheme != schemeHTTP && u.Scheme != schemeHTTPS) || (u.Path != "" && u.Path != "/") {
-		return nil, fmt.Errorf("invalid S3 public URL %q: expected http(s)://host[:port]", publicURL)
+	u, err := parseS3PublicURL(publicURL)
+	if err != nil {
+		return nil, err
 	}
 
 	if region == "" {
@@ -233,6 +250,12 @@ func NewPresignClient(
 		}
 	}
 
+	return newPresignClient(u, creds, region, lookup)
+}
+
+// newPresignClient returns a client that presigns offline for the endpoint u,
+// a URL parseS3PublicURL accepted, in region.
+func newPresignClient(u *url.URL, creds *credentials.Credentials, region string, lookup minio.BucketLookupType) (*minio.Client, error) {
 	client, err := minio.New(u.Host, &minio.Options{
 		Creds:        creds,
 		Secure:       u.Scheme == schemeHTTPS,
@@ -244,6 +267,15 @@ func NewPresignClient(
 	}
 
 	return client, nil
+}
+
+func parseS3PublicURL(publicURL string) (*url.URL, error) {
+	u, err := url.Parse(publicURL)
+	if err != nil || u.Host == "" || (u.Scheme != schemeHTTP && u.Scheme != schemeHTTPS) || (u.Path != "" && u.Path != "/") {
+		return nil, fmt.Errorf("invalid S3 public URL %q: expected http(s)://host[:port]", publicURL)
+	}
+
+	return u, nil
 }
 
 func runServer(opts *options) error { //nolint:maintidx // one linear startup sequence
@@ -388,6 +420,12 @@ func runServer(opts *options) error { //nolint:maintidx // one linear startup se
 
 		if opts.ReadRedirectTTL > 0 {
 			slog.Info("NAR reads redirect to presigned S3 URLs", "ttl", opts.ReadRedirectTTL)
+		}
+
+		if err := service.loadRedirectRoutes(opts); err != nil {
+			stopStreams()
+
+			return err
 		}
 
 		if err := service.enablePullThrough(opts); err != nil {

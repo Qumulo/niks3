@@ -5,11 +5,28 @@ import (
 	"crypto/tls"
 	"net"
 	"net/http"
+	"net/netip"
 	"time"
 
 	"github.com/Mic92/niks3/api"
 	"github.com/Mic92/niks3/server/signing"
 )
+
+// ClientAddr exposes clientAddr to tests.
+func ClientAddr(r *http.Request, trustedProxies []netip.Prefix) (netip.Addr, error) {
+	return clientAddr(r, trustedProxies)
+}
+
+// ValidateReadRedirectForTest runs validateReadRedirect on a read proxy with
+// the given redirect settings.
+func ValidateReadRedirectForTest(ttl time.Duration, routesPath string, trustedProxies []string) error {
+	return validateReadRedirect(&options{
+		EnableReadProxy:        true,
+		ReadRedirectTTL:        ttl,
+		ReadRedirectRoutesPath: routesPath,
+		TrustedProxies:         trustedProxies,
+	})
+}
 
 // SystemdListenerForTest exposes systemdListener to tests.
 func SystemdListenerForTest() (net.Listener, error) { return systemdListener() }

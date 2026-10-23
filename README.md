@@ -53,6 +53,31 @@ presigned S3 URL instead of being streamed, so NAR bytes bypass niks3. Narinfos
 and other metadata stay proxied. Note that anyone holding such a URL can fetch
 that object until it expires, regardless of read-proxy authentication.
 
+`--read-redirect-routes routes.json` sends the redirects of some clients to
+another S3 endpoint serving the same objects under the same keys, such as a
+read-only replica of the bucket nearer to them. The first route whose CIDRs
+hold the client signs its URL with that endpoint's keys, which need only read
+access; other clients get the server's own S3:
+
+```json
+[{
+  "cidrs": ["198.51.100.0/24"],
+  "s3_url": "https://replica.example.com:9000",
+  "bucket": "nix-store",
+  "access_key_path": "/run/secrets/replica/access-key",
+  "secret_key_path": "/run/secrets/replica/secret-key"
+}]
+```
+
+`bucket` defaults to `--s3-bucket` and `region` to the primary bucket's, so the
+server never contacts the endpoint itself. The endpoint must serve an object as
+soon as the primary does: one that copies asynchronously answers 404 for a NAR
+pushed moments ago, after its narinfo said the NAR exists, and Nix fails that
+substitution. Behind a reverse proxy, name it with `--trusted-proxy CIDR`
+(repeatable) so its `X-Forwarded-For` identifies the client; otherwise every
+client looks like the proxy. `niks3_read_redirects_total{endpoint}` counts
+redirects by the endpoint signing them.
+
 ### Pull-through (optional)
 
 ```mermaid
