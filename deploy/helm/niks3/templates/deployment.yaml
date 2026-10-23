@@ -93,6 +93,20 @@ spec:
             - name: NIKS3_READ_REDIRECT_TTL
               value: {{ .Values.readProxy.redirectTTL | quote }}
             {{- end }}
+            {{- if include "niks3.redirectRoutes" . }}
+            {{- if kindIs "invalid" .Values.readProxy.redirectTTL }}
+            {{- fail "readProxy.redirectRoutes requires readProxy.redirectTTL" }}
+            {{- end }}
+            - name: NIKS3_READ_REDIRECT_ROUTES
+              value: /etc/niks3-redirect-routes/redirect-routes.json
+            {{- end }}
+            {{- if and .Values.readProxy.trustedProxies (not (include "niks3.redirectRoutes" .)) }}
+            {{- fail "readProxy.trustedProxies is only used by readProxy.redirectRoutes" }}
+            {{- end }}
+            {{- with .Values.readProxy.trustedProxies }}
+            - name: NIKS3_TRUSTED_PROXIES
+              value: {{ join " " . | quote }}
+            {{- end }}
             {{- with .Values.readProxy.trustedKeys }}
             - name: NIKS3_TRUSTED_KEYS
               value: {{ join " " . | quote }}
@@ -181,6 +195,16 @@ spec:
               mountPath: /etc/niks3
               readOnly: true
             {{- end }}
+            {{- if include "niks3.redirectRoutes" . }}
+            - name: redirect-routes
+              mountPath: /etc/niks3-redirect-routes
+              readOnly: true
+            {{- range $i, $route := .Values.readProxy.redirectRoutes }}
+            - name: redirect-route-{{ $i }}
+              mountPath: /secrets/redirect-routes/{{ $i }}
+              readOnly: true
+            {{- end }}
+            {{- end }}
       volumes:
         - name: db
           secret:
@@ -202,6 +226,16 @@ spec:
         - name: oidc
           configMap:
             name: {{ include "niks3.fullname" . }}-oidc
+        {{- end }}
+        {{- if include "niks3.redirectRoutes" . }}
+        - name: redirect-routes
+          configMap:
+            name: {{ include "niks3.fullname" . }}-redirect-routes
+        {{- range $i, $route := .Values.readProxy.redirectRoutes }}
+        - name: redirect-route-{{ $i }}
+          secret:
+            secretName: {{ required "readProxy.redirectRoutes[].existingSecret is required" $route.existingSecret }}
+        {{- end }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector: {{- toYaml . | nindent 8 }}
