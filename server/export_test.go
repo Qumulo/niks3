@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/tls"
+	"io"
 	"net"
 	"net/http"
 	"time"
@@ -134,6 +135,50 @@ func (n *Narinfo) RefKeys() []string { return n.refKeys() }
 func (n *Narinfo) SigningInfo() *signing.NarInfo { return n.signingInfo() }
 
 func HashMatches(nixHash string, digest []byte) bool { return hashMatches(nixHash, digest) }
+
+// NarExpectation is what VerifyNar checks a NAR file against.
+type NarExpectation struct {
+	Compression string
+	NarHash     string
+	NarSize     uint64
+	CA          string
+	HashPart    string
+}
+
+func (e NarExpectation) internal() narExpectation {
+	return narExpectation{
+		compression: narCompression(e.Compression),
+		narHash:     e.NarHash,
+		narSize:     e.NarSize,
+		ca:          e.CA,
+		hashPart:    e.HashPart,
+	}
+}
+
+var (
+	ErrNarMismatch     = errNarMismatch
+	ErrNarUnverifiable = errNarUnverifiable
+)
+
+// VerifyNar exposes verifyNar to tests.
+func VerifyNar(file io.Reader, want NarExpectation) error { return verifyNar(file, want.internal()) }
+
+// VerifyNarStreaming feeds file to a narVerifier in chunks of the given
+// size, as a fill does.
+func VerifyNarStreaming(file []byte, chunk int, want NarExpectation) error {
+	v := newNarVerifier(want.internal())
+
+	for len(file) > 0 {
+		n := min(chunk, len(file))
+		if _, err := v.Write(file[:n]); err != nil {
+			return err
+		}
+
+		file = file[n:]
+	}
+
+	return v.finish()
+}
 
 // RequestWho is an export of requestWho for tests.
 func RequestWho(r *http.Request) string { return requestWho(r) }
