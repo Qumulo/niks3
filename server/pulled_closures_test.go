@@ -209,6 +209,7 @@ func TestGCSweepsOrphanedPulledNars(t *testing.T) {
 
 	ok(t, queries.UpsertPulledNar(ctx, pg.UpsertPulledNarParams{
 		Key: narKey, NarinfoKey: narinfoKey, FileHash: "sha256:abc", FileSize: 42, NarSize: 64,
+		NarHash: "sha256:nar", Compression: "xz", Ca: "fixed:r:sha256:ca",
 	}))
 	ok(t, queries.UpsertPulledNar(ctx, pg.UpsertPulledNarParams{
 		Key: orphanKey, NarinfoKey: "0000000000000000000000000000000a.narinfo", FileHash: "sha256:def", FileSize: 1, NarSize: 2,
@@ -217,7 +218,8 @@ func TestGCSweepsOrphanedPulledNars(t *testing.T) {
 	meta, err := queries.GetPulledNar(ctx, narKey)
 	ok(t, err)
 
-	if meta.NarinfoKey != narinfoKey || meta.FileHash != "sha256:abc" || meta.FileSize != 42 || meta.NarSize != 64 {
+	if meta.NarinfoKey != narinfoKey || meta.NarSize != 64 || meta.NarHash != "sha256:nar" ||
+		meta.Compression != "xz" || meta.Ca != "fixed:r:sha256:ca" {
 		t.Errorf("GetPulledNar = %+v", meta)
 	}
 

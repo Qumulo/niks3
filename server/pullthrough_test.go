@@ -113,7 +113,9 @@ func newFixture(tb testing.TB, hash string, nar []byte) *fixture {
 }
 
 // newFixtureSignedBy signs the fixture with a fresh key of the given name.
-func newFixtureSignedBy(tb testing.TB, hash string, nar []byte, keyName string) *fixture {
+// The path holds one regular file with the given contents; its NAR file
+// is zstd-compressed and named by NarHash, as cache.nixos.org's are.
+func newFixtureSignedBy(tb testing.TB, hash string, contents []byte, keyName string) *fixture {
 	tb.Helper()
 
 	seed := make([]byte, 32)
@@ -126,14 +128,17 @@ func newFixtureSignedBy(tb testing.TB, hash string, nar []byte, keyName string) 
 	publicKey, err := signer.PublicKey()
 	ok(tb, err)
 
+	narBytes := narFile(string(contents))
+	narDigest := sha256.Sum256(narBytes)
+	nar := zstdOf(tb, narBytes)
 	fileDigest := sha256.Sum256(nar)
 	fileHash := client.EncodeNixBase32(fileDigest[:])
-	narKey := "nar/" + fileHash + ".nar.xz"
+	narKey := "nar/" + client.EncodeNixBase32(narDigest[:]) + ".nar.zst"
 
 	info := &signing.NarInfo{
 		StorePath:  "/nix/store/" + hash + "-hello-2.12.1",
-		NarHash:    "sha256:1mkvday29m2qxg1fnbv8xh9s6151bh8a2xzhh0k86j7lqhyfwibh",
-		NarSize:    226560,
+		NarHash:    "sha256:" + client.EncodeNixBase32(narDigest[:]),
+		NarSize:    uint64(len(narBytes)),
 		References: []string{"/nix/store/4hcdxyjf9yiq7qf3i4548drb6sjmwa1v-glibc-2.39-52"},
 	}
 
@@ -142,7 +147,7 @@ func newFixtureSignedBy(tb testing.TB, hash string, nar []byte, keyName string) 
 
 	narinfo := fmt.Sprintf(`StorePath: %s
 URL: %s
-Compression: xz
+Compression: zstd
 FileHash: sha256:%s
 FileSize: %d
 NarHash: %s
@@ -168,7 +173,7 @@ func (f *fixture) publish(u *fakeUpstream) {
 	u.put(f.narKey, f.nar)
 }
 
-func randomNar(tb testing.TB, size int) []byte {
+func randomBytes(tb testing.TB, size int) []byte {
 	tb.Helper()
 
 	nar := make([]byte, size)
@@ -347,7 +352,7 @@ func TestPullThroughNarinfoMissThenHit(t *testing.T) {
 
 	ctx := t.Context()
 	upstream := newFakeUpstream(t)
-	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 4096))
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomBytes(t, 4096))
 	fx.publish(upstream)
 
 	service := createPullThroughTestService(t, upstream, fx.publicKey)
@@ -427,7 +432,7 @@ func testPullThroughNarMissThenHit(t *testing.T, secure bool) {
 	ctx := t.Context()
 	upstream := newFakeUpstream(t)
 	// Larger than one minio part so the multipart path is exercised.
-	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 20<<20))
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomBytes(t, 20<<20))
 	fx.publish(upstream)
 
 	service := createPullThroughTestService(t, upstream, fx.publicKey)
@@ -482,7 +487,7 @@ func TestPullThroughRangeOnMissPassesThrough(t *testing.T) {
 
 	ctx := t.Context()
 	upstream := newFakeUpstream(t)
-	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 8192))
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomBytes(t, 8192))
 	fx.publish(upstream)
 
 	service := createPullThroughTestService(t, upstream, fx.publicKey)
@@ -509,7 +514,7 @@ func TestPullThroughRangeOnMissPassesThrough(t *testing.T) {
 		t.Errorf("status=%d len=%d, want 206 and bytes 100-199", resp.StatusCode, len(body))
 	}
 
-	if cr := resp.Header.Get("Content-Range"); cr != "bytes 100-199/8192" {
+	if cr := resp.Header.Get("Content-Range"); cr != fmt.Sprintf("bytes 100-199/%d", len(fx.nar)) {
 		t.Errorf("Content-Range = %q", cr)
 	}
 
@@ -531,7 +536,7 @@ func TestPullThroughHeadMiss(t *testing.T) {
 
 	ctx := t.Context()
 	upstream := newFakeUpstream(t)
-	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 1024))
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomBytes(t, 1024))
 	fx.publish(upstream)
 
 	service := createPullThroughTestService(t, upstream, fx.publicKey)
@@ -568,13 +573,13 @@ func TestPullThroughHeadRejectsLikeGet(t *testing.T) {
 	t.Parallel()
 
 	upstream := newFakeUpstream(t)
-	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 1024))
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomBytes(t, 1024))
 	fx.publish(upstream)
 	// fx's narinfo under a hash its StorePath does not match.
 	upstream.put("4hcdxyjf9yiq7qf3i4548drb6sjmwa1v.narinfo", fx.narinfo)
 
 	// Trust an unrelated key only.
-	other := newFixture(t, "sl141d1g77wvhr050ah87lcyz2czdxa3", randomNar(t, 16))
+	other := newFixture(t, "sl141d1g77wvhr050ah87lcyz2czdxa3", randomBytes(t, 16))
 
 	service := createPullThroughTestService(t, upstream, other.publicKey)
 	defer service.Close()
@@ -611,7 +616,7 @@ func TestPullThroughNegativeCache(t *testing.T) {
 	t.Parallel()
 
 	upstream := newFakeUpstream(t)
-	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 16))
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomBytes(t, 16))
 
 	service := createPullThroughTestService(t, upstream, fx.publicKey)
 	defer service.Close()
@@ -652,7 +657,7 @@ func TestPullThroughNarinfoCompressedUpstream(t *testing.T) {
 
 	ctx := t.Context()
 	upstream := newFakeUpstream(t)
-	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 16))
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomBytes(t, 16))
 	upstream.put(fx.narinfoKey, zstdCompress(t, fx.narinfo))
 
 	service := createPullThroughTestService(t, upstream, fx.publicKey)
@@ -676,11 +681,11 @@ func TestPullThroughTrustedKeys(t *testing.T) {
 
 	ctx := t.Context()
 	upstream := newFakeUpstream(t)
-	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 1024))
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomBytes(t, 1024))
 	fx.publish(upstream)
 
 	// An unrelated key: fx's signature must not verify against it.
-	other := newFixture(t, "4hcdxyjf9yiq7qf3i4548drb6sjmwa1v", randomNar(t, 16))
+	other := newFixture(t, "4hcdxyjf9yiq7qf3i4548drb6sjmwa1v", randomBytes(t, 16))
 
 	service := createPullThroughTestService(t, upstream, other.publicKey)
 	defer service.Close()
@@ -732,7 +737,7 @@ func TestPullThroughUploadTakesOverPulledClosure(t *testing.T) {
 
 	ctx := t.Context()
 	upstream := newFakeUpstream(t)
-	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 64))
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomBytes(t, 64))
 	fx.publish(upstream)
 
 	service := createPullThroughTestService(t, upstream, fx.publicKey)
@@ -756,7 +761,7 @@ func TestPullThroughUploadTakesOverPulledClosure(t *testing.T) {
 	}
 
 	// Dropping the key that signed the pull no longer matters.
-	other := newFixtureSignedBy(t, "4hcdxyjf9yiq7qf3i4548drb6sjmwa1v", randomNar(t, 16), "signer-2")
+	other := newFixtureSignedBy(t, "4hcdxyjf9yiq7qf3i4548drb6sjmwa1v", randomBytes(t, 16), "signer-2")
 	service.PullThrough, _ = server.NewPullThrough(server.PullThroughConfig{
 		Upstreams:   []string{upstream.srv.URL},
 		TrustedKeys: []string{other.publicKey},
@@ -789,7 +794,7 @@ func TestPullThroughRejectsMismatchedStorePath(t *testing.T) {
 	t.Parallel()
 
 	upstream := newFakeUpstream(t)
-	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 64))
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomBytes(t, 64))
 	// Publish fx's narinfo under a different hash.
 	upstream.put("4hcdxyjf9yiq7qf3i4548drb6sjmwa1v.narinfo", fx.narinfo)
 
@@ -802,20 +807,20 @@ func TestPullThroughRejectsMismatchedStorePath(t *testing.T) {
 	proxyGet(t, ts, "/4hcdxyjf9yiq7qf3i4548drb6sjmwa1v.narinfo", http.StatusBadGateway)
 }
 
-func TestPullThroughNarFileHashMismatchNotStored(t *testing.T) {
+func TestPullThroughNarFailingVerificationNotStored(t *testing.T) {
 	t.Parallel()
-	forEachS3Transport(t, testPullThroughNarFileHashMismatchNotStored)
+	forEachS3Transport(t, testPullThroughNarFailingVerificationNotStored)
 }
 
-func testPullThroughNarFileHashMismatchNotStored(t *testing.T, secure bool) {
+func testPullThroughNarFailingVerificationNotStored(t *testing.T, secure bool) {
 	t.Helper()
 
 	ctx := t.Context()
 	upstream := newFakeUpstream(t)
-	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 4096))
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomBytes(t, 4096))
 	upstream.put(fx.narinfoKey, fx.narinfo)
-	// Same size, different bytes: only the hash check can catch this.
-	upstream.put(fx.narKey, randomNar(t, len(fx.nar)))
+	// Same size, different bytes: only verification can catch this.
+	upstream.put(fx.narKey, randomBytes(t, len(fx.nar)))
 
 	service := createPullThroughTestService(t, upstream, fx.publicKey)
 	defer service.Close()
@@ -835,11 +840,11 @@ func testPullThroughNarFileHashMismatchNotStored(t *testing.T, secure bool) {
 	time.Sleep(200 * time.Millisecond)
 
 	if _, _, found := s3Object(ctx, t, service, fx.narKey); found {
-		t.Error("NAR with wrong FileHash was stored")
+		t.Error("NAR failing verification was stored")
 	}
 
 	if _, _, found := getObjectRow(ctx, t, service, fx.narKey); found {
-		t.Error("NAR with wrong FileHash was registered")
+		t.Error("NAR failing verification was registered")
 	}
 }
 
@@ -848,7 +853,7 @@ func TestPullThroughNarWithoutNarinfoNotStored(t *testing.T) {
 
 	ctx := t.Context()
 	upstream := newFakeUpstream(t)
-	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 4096))
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomBytes(t, 4096))
 	fx.publish(upstream)
 
 	service := createPullThroughTestService(t, upstream, fx.publicKey)
@@ -883,9 +888,9 @@ func TestPullThroughNarVerifiedFromDatabase(t *testing.T) {
 
 	ctx := t.Context()
 	upstream := newFakeUpstream(t)
-	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 4096))
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomBytes(t, 4096))
 	upstream.put(fx.narinfoKey, fx.narinfo)
-	upstream.put(fx.narKey, randomNar(t, len(fx.nar)))
+	upstream.put(fx.narKey, randomBytes(t, len(fx.nar)))
 
 	service := createPullThroughTestService(t, upstream, fx.publicKey)
 	defer service.Close()
@@ -917,14 +922,204 @@ func TestPullThroughNarVerifiedFromDatabase(t *testing.T) {
 	}
 }
 
-// A chunked upstream with no FileSize to size the transfer by must be
-// bounded by progress, not by the flat budget for a zero-byte object.
+// cache.nixos.org names NARs by NarHash and has re-uploaded some
+// recompressed, leaving the file at a narinfo's URL different from its
+// FileHash and FileSize. Nix substitutes such a path, as it never looks at
+// those, so the fill must serve and store it too.
+func TestPullThroughNarReplacedUpstreamStored(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	upstream := newFakeUpstream(t)
+	contents := bytes.Repeat([]byte("lwarp-0.921-tex "), 1<<14)
+	fx := newFixture(t, "kz1ybz64i7sj8rhcp1qp3j20lq467b5b", contents)
+	fx.publish(upstream)
+
+	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBestCompression))
+	ok(t, err)
+
+	recompressed := enc.EncodeAll(narFile(string(contents)), nil)
+	if len(recompressed) == len(fx.nar) {
+		t.Fatal("recompression did not change the file's size")
+	}
+
+	upstream.put(fx.narKey, recompressed)
+
+	service := createPullThroughTestService(t, upstream, fx.publicKey)
+	defer service.Close()
+
+	ts := setupProxyServer(t, service)
+	defer ts.Close()
+
+	proxyGet(t, ts, "/"+fx.narinfoKey, http.StatusOK)
+
+	header, body := proxyGet(t, ts, "/"+fx.narKey, http.StatusOK)
+	if !bytes.Equal(body, recompressed) || header.Get("Content-Length") != strconv.Itoa(len(recompressed)) {
+		t.Fatalf("client got %d bytes (Content-Length %s), want the %d upstream has",
+			len(body), header.Get("Content-Length"), len(recompressed))
+	}
+
+	if stored := waitForFill(ctx, t, service, fx.narKey); !bytes.Equal(stored, recompressed) {
+		t.Fatal("replaced NAR not stored intact")
+	}
+}
+
+// A pulled_nars row from before NARs were verified as Nix verifies them
+// lacks NarHash and the rest. The NAR is still verified and stored, from
+// the stored narinfo, and the row is completed.
+func TestPullThroughNarLegacyRowCompletedFromNarinfo(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	upstream := newFakeUpstream(t)
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomBytes(t, 4096))
+	fx.publish(upstream)
+
+	service := createPullThroughTestService(t, upstream, fx.publicKey)
+	defer service.Close()
+
+	ts := setupProxyServer(t, service)
+	defer ts.Close()
+
+	proxyGet(t, ts, "/"+fx.narinfoKey, http.StatusOK)
+	waitForFill(ctx, t, service, fx.narinfoKey)
+
+	_, err := service.Pool.Exec(ctx,
+		`UPDATE pulled_nars SET nar_hash = '', compression = '', ca = '' WHERE key = $1`, fx.narKey)
+	ok(t, err)
+
+	fresh, err := server.NewPullThrough(server.PullThroughConfig{
+		Upstreams:   []string{upstream.srv.URL},
+		TrustedKeys: []string{fx.publicKey},
+	})
+	ok(t, err)
+
+	service.PullThrough = fresh
+
+	proxyGet(t, ts, "/"+fx.narKey, http.StatusOK)
+
+	if stored := waitForFill(ctx, t, service, fx.narKey); !bytes.Equal(stored, fx.nar) {
+		t.Fatal("NAR not stored intact")
+	}
+
+	row, err := pg.New(service.Pool).GetPulledNar(ctx, fx.narKey)
+	ok(t, err)
+
+	if !strings.HasPrefix(row.NarHash, "sha256:") || row.Compression != "zstd" {
+		t.Errorf("legacy row not completed: %+v", row)
+	}
+}
+
+// A legacy row whose narinfo is gone leaves its NAR unverifiable, and
+// that is remembered: the next read does not go back to S3 for the
+// narinfo, so it does not notice the row pointing somewhere useful again.
+func TestPullThroughNarStaleLegacyRowRemembered(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	upstream := newFakeUpstream(t)
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomBytes(t, 4096))
+	fx.publish(upstream)
+
+	service := createPullThroughTestService(t, upstream, fx.publicKey)
+	defer service.Close()
+
+	ts := setupProxyServer(t, service)
+	defer ts.Close()
+
+	proxyGet(t, ts, "/"+fx.narinfoKey, http.StatusOK)
+	waitForFill(ctx, t, service, fx.narinfoKey)
+
+	_, err := service.Pool.Exec(ctx,
+		`UPDATE pulled_nars SET nar_hash = '', compression = '', ca = '', narinfo_key = 'gone.narinfo' WHERE key = $1`,
+		fx.narKey)
+	ok(t, err)
+
+	fresh, err := server.NewPullThrough(server.PullThroughConfig{
+		Upstreams:   []string{upstream.srv.URL},
+		TrustedKeys: []string{fx.publicKey},
+	})
+	ok(t, err)
+
+	service.PullThrough = fresh
+
+	_, body := proxyGet(t, ts, "/"+fx.narKey, http.StatusOK)
+	if !bytes.Equal(body, fx.nar) {
+		t.Fatal("client did not receive the NAR")
+	}
+
+	waitForNoFill(ctx, t, service, fx.narKey)
+
+	_, err = service.Pool.Exec(ctx, `UPDATE pulled_nars SET narinfo_key = $1 WHERE key = $2`, fx.narinfoKey, fx.narKey)
+	ok(t, err)
+
+	proxyGet(t, ts, "/"+fx.narKey, http.StatusOK)
+	waitForNoFill(ctx, t, service, fx.narKey)
+}
+
+// Compression is unsigned and upstream's to choose. However long it is,
+// the narinfo is still registered; its NAR, which Nix would refuse, is
+// not stored.
+func TestPullThroughLongCompressionStillRegistered(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	upstream := newFakeUpstream(t)
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomBytes(t, 4096))
+	upstream.put(fx.narinfoKey, bytes.Replace(fx.narinfo,
+		[]byte("Compression: zstd"), []byte("Compression: "+strings.Repeat("z", 200)), 1))
+	upstream.put(fx.narKey, fx.nar)
+
+	service := createPullThroughTestService(t, upstream, fx.publicKey)
+	defer service.Close()
+
+	ts := setupProxyServer(t, service)
+	defer ts.Close()
+
+	proxyGet(t, ts, "/"+fx.narinfoKey, http.StatusOK)
+	waitForFill(ctx, t, service, fx.narinfoKey)
+
+	proxyGet(t, ts, "/"+fx.narKey, http.StatusOK)
+	waitForNoFill(ctx, t, service, fx.narKey)
+}
+
+// A NAR this server cannot check the way Nix would is served, as Nix
+// checks it itself, but not stored.
+func TestPullThroughNarUnverifiableNotStored(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	upstream := newFakeUpstream(t)
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomBytes(t, 4096))
+	// Compression is not covered by the signature.
+	upstream.put(fx.narinfoKey, bytes.Replace(fx.narinfo, []byte("Compression: zstd"), []byte("Compression: br"), 1))
+	upstream.put(fx.narKey, fx.nar)
+
+	service := createPullThroughTestService(t, upstream, fx.publicKey)
+	defer service.Close()
+
+	ts := setupProxyServer(t, service)
+	defer ts.Close()
+
+	proxyGet(t, ts, "/"+fx.narinfoKey, http.StatusOK)
+
+	_, body := proxyGet(t, ts, "/"+fx.narKey, http.StatusOK)
+	if !bytes.Equal(body, fx.nar) {
+		t.Fatal("client did not receive the NAR")
+	}
+
+	waitForNoFill(ctx, t, service, fx.narKey)
+}
+
+// A chunked upstream, whose NAR's size is unknown (the narinfo's FileSize
+// is not trusted to size it, and here there is none), must be bounded by
+// progress, not by the flat budget for a zero-byte object.
 func TestPullThroughUnknownSizeBoundedByProgress(t *testing.T) {
 	t.Parallel()
 
 	ctx := t.Context()
 	upstream := newFakeUpstream(t)
-	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 2<<20))
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomBytes(t, 2<<20))
 
 	// FileSize is not covered by the signature, so dropping it keeps the
 	// narinfo valid while leaving the NAR's size unknown.
@@ -987,25 +1182,24 @@ func TestPullThroughUnknownSizeBoundedByProgress(t *testing.T) {
 	}
 }
 
-func TestPullThroughNarLongerThanFileSizeNotStored(t *testing.T) {
+func TestPullThroughNarWithTrailingGarbageNotStored(t *testing.T) {
 	t.Parallel()
-	forEachS3Transport(t, testPullThroughNarLongerThanFileSizeNotStored)
+	forEachS3Transport(t, testPullThroughNarWithTrailingGarbageNotStored)
 }
 
-func testPullThroughNarLongerThanFileSizeNotStored(t *testing.T, secure bool) {
+func testPullThroughNarWithTrailingGarbageNotStored(t *testing.T, secure bool) {
 	t.Helper()
 
 	ctx := t.Context()
 	upstream := newFakeUpstream(t)
-	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 4096))
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomBytes(t, 4096))
 	fx.publish(upstream)
 
-	// A chunked upstream (no Content-Length) that keeps sending past the
-	// FileSize the narinfo announced. minio stops reading at that size and
-	// completes the upload; the fill must notice, not hang on the dead
-	// pipe, and take the object back out. The pause makes the NAR and the
-	// surplus arrive as separate reads, so the fill has released the
-	// whole announced size to S3 before it learns the body runs long.
+	// A chunked upstream (no Content-Length) that keeps sending after the
+	// compressed NAR ends. Nix reads a NAR file to its end and rejects
+	// junk after the compressed stream, so the fill must not keep it. The
+	// pause makes the NAR and the surplus arrive as separate reads, so the
+	// fill has handed S3 all of the good bytes before the junk arrives.
 	upstream.beforeServe = func(key string, w http.ResponseWriter) bool {
 		if key != fx.narKey {
 			return false
@@ -1039,11 +1233,11 @@ func testPullThroughNarLongerThanFileSizeNotStored(t *testing.T, secure bool) {
 	go func() {
 		defer close(done)
 
-		// The announced Content-Length is the FileSize, so the client sees
-		// exactly the NAR.
+		// No length was announced, so the client gets what upstream sent
+		// and judges it itself.
 		_, body := proxyGet(t, ts, "/"+fx.narKey, http.StatusOK)
-		if !bytes.Equal(body, fx.nar) {
-			t.Error("client did not receive the NAR")
+		if !bytes.Equal(body, append(append([]byte{}, fx.nar...), "trailing garbage"...)) {
+			t.Error("client did not receive what upstream sent")
 		}
 	}()
 
@@ -1064,7 +1258,7 @@ func testPullThroughNarLongerThanFileSizeNotStored(t *testing.T, secure bool) {
 		}
 
 		if time.Now().After(deadline) {
-			t.Fatalf("over-long NAR kept (s3=%v db=%v)", inS3, inDB)
+			t.Fatalf("NAR with trailing garbage kept (s3=%v db=%v)", inS3, inDB)
 		}
 
 		time.Sleep(20 * time.Millisecond)
@@ -1076,7 +1270,7 @@ func TestPullThroughConcurrentFillsOnce(t *testing.T) {
 
 	ctx := t.Context()
 	upstream := newFakeUpstream(t)
-	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 1<<20))
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomBytes(t, 1<<20))
 	fx.publish(upstream)
 
 	// Hold both NAR requests until they have both arrived, so both are in
@@ -1129,7 +1323,7 @@ func TestPullThroughFillSurvivesClientDisconnect(t *testing.T) {
 
 	ctx := t.Context()
 	upstream := newFakeUpstream(t)
-	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 4<<20))
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomBytes(t, 4<<20))
 	fx.publish(upstream)
 
 	// Trickle the NAR so the client can go away mid-transfer.
@@ -1190,7 +1384,7 @@ func TestPullThroughRedirectUsesDatabase(t *testing.T) {
 
 	ctx := t.Context()
 	upstream := newFakeUpstream(t)
-	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 2048))
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomBytes(t, 2048))
 	fx.publish(upstream)
 
 	service := createPullThroughTestService(t, upstream, fx.publicKey)
@@ -1273,7 +1467,7 @@ func TestPullThroughGCSameAgeAsUploads(t *testing.T) {
 
 	ctx := t.Context()
 	upstream := newFakeUpstream(t)
-	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 64))
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomBytes(t, 64))
 	fx.publish(upstream)
 
 	service := createPullThroughTestService(t, upstream, fx.publicKey)
@@ -1342,7 +1536,7 @@ func TestPullThroughFillSurvivesGCRowFlush(t *testing.T) {
 
 	ctx := t.Context()
 	upstream := newFakeUpstream(t)
-	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 64))
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomBytes(t, 64))
 	fx.publish(upstream)
 
 	service := createPullThroughTestService(t, upstream, fx.publicKey)
@@ -1387,7 +1581,7 @@ func TestPullThroughFillSurvivesGCRowFlush(t *testing.T) {
 func TestNewPullThroughValidation(t *testing.T) {
 	t.Parallel()
 
-	key := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 16)).publicKey
+	key := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomBytes(t, 16)).publicKey
 
 	bad := []server.PullThroughConfig{
 		{},
@@ -1423,7 +1617,7 @@ func TestPullThroughGCKeepsReachableTombstonedNar(t *testing.T) {
 
 	ctx := t.Context()
 	upstream := newFakeUpstream(t)
-	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 64))
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomBytes(t, 64))
 	fx.publish(upstream)
 
 	service := createPullThroughTestService(t, upstream, fx.publicKey)
@@ -1492,9 +1686,9 @@ func TestPullThroughGCExpiresUntrustedKeys(t *testing.T) {
 
 	ctx := t.Context()
 	upstream := newFakeUpstream(t)
-	signed := newFixtureSignedBy(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 64), "signer-1")
-	pinned := newFixtureSignedBy(t, "0000000000000000000000000000000a", randomNar(t, 64), "signer-2")
-	replacement := newFixtureSignedBy(t, "4hcdxyjf9yiq7qf3i4548drb6sjmwa1v", randomNar(t, 64), "signer-3")
+	signed := newFixtureSignedBy(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomBytes(t, 64), "signer-1")
+	pinned := newFixtureSignedBy(t, "0000000000000000000000000000000a", randomBytes(t, 64), "signer-2")
+	replacement := newFixtureSignedBy(t, "4hcdxyjf9yiq7qf3i4548drb6sjmwa1v", randomBytes(t, 64), "signer-3")
 
 	signed.publish(upstream)
 	pinned.publish(upstream)
@@ -1592,7 +1786,7 @@ func TestPullThroughAdoptsUntrackedNarinfo(t *testing.T) {
 
 	ctx := t.Context()
 	upstream := newFakeUpstream(t)
-	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 64))
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomBytes(t, 64))
 	fx.publish(upstream)
 
 	service := createPullThroughTestService(t, upstream, fx.publicKey)
@@ -1648,7 +1842,7 @@ func TestPullThroughAdoptsUntrackedNar(t *testing.T) {
 
 	ctx := t.Context()
 	upstream := newFakeUpstream(t)
-	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 64))
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomBytes(t, 64))
 	fx.publish(upstream)
 
 	service := createPullThroughTestService(t, upstream, fx.publicKey)
@@ -1695,8 +1889,8 @@ func TestPullThroughAdoptionLeavesForeignAndTombstonedAlone(t *testing.T) {
 
 	ctx := t.Context()
 	upstream := newFakeUpstream(t)
-	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 64))
-	foreign := newFixture(t, "4hcdxyjf9yiq7qf3i4548drb6sjmwa1v", randomNar(t, 64))
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomBytes(t, 64))
+	foreign := newFixture(t, "4hcdxyjf9yiq7qf3i4548drb6sjmwa1v", randomBytes(t, 64))
 
 	fx.publish(upstream)
 
@@ -1738,7 +1932,7 @@ func TestPullThroughAdoptionLeavesForeignAndTombstonedAlone(t *testing.T) {
 func TestTrustedKeysWithSigning(t *testing.T) {
 	t.Parallel()
 
-	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomNar(t, 16))
+	fx := newFixture(t, "26xbg1ndr7hbcncrlf9nhx5is2b25d13", randomBytes(t, 16))
 
 	keys, err := server.TrustedKeysWithSigning([]string{"cache.nixos.org-1:abc"}, []signing.Signer{fx.signer})
 	ok(t, err)

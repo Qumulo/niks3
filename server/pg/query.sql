@@ -248,16 +248,19 @@ ON CONFLICT (key) DO UPDATE SET
 
 -- name: UpsertPulledNar :exec
 -- Remember what a pulled narinfo said about its NAR.
-INSERT INTO pulled_nars (key, narinfo_key, file_hash, file_size, nar_size)
-VALUES ($1, $2, $3, $4, $5)
+INSERT INTO pulled_nars (key, narinfo_key, file_hash, file_size, nar_size, nar_hash, compression, ca)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 ON CONFLICT (key) DO UPDATE SET
     narinfo_key = excluded.narinfo_key,
     file_hash = excluded.file_hash,
     file_size = excluded.file_size,
-    nar_size = excluded.nar_size;
+    nar_size = excluded.nar_size,
+    nar_hash = excluded.nar_hash,
+    compression = excluded.compression,
+    ca = excluded.ca;
 
 -- name: GetPulledNar :one
-SELECT narinfo_key, file_hash, file_size, nar_size FROM pulled_nars
+SELECT narinfo_key, nar_size, nar_hash, compression, ca FROM pulled_nars
 WHERE key = $1;
 
 -- name: DeleteOrphanedPulledNars :execrows

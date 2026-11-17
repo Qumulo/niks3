@@ -523,15 +523,16 @@ func (q *Queries) GetPresentObjects(ctx context.Context, dollar_1 []string) ([]s
 }
 
 const getPulledNar = `-- name: GetPulledNar :one
-SELECT narinfo_key, file_hash, file_size, nar_size FROM pulled_nars
+SELECT narinfo_key, nar_size, nar_hash, compression, ca FROM pulled_nars
 WHERE key = $1
 `
 
 type GetPulledNarRow struct {
-	NarinfoKey string `json:"narinfo_key"`
-	FileHash   string `json:"file_hash"`
-	FileSize   int64  `json:"file_size"`
-	NarSize    int64  `json:"nar_size"`
+	NarinfoKey  string `json:"narinfo_key"`
+	NarSize     int64  `json:"nar_size"`
+	NarHash     string `json:"nar_hash"`
+	Compression string `json:"compression"`
+	Ca          string `json:"ca"`
 }
 
 func (q *Queries) GetPulledNar(ctx context.Context, key string) (GetPulledNarRow, error) {
@@ -539,9 +540,10 @@ func (q *Queries) GetPulledNar(ctx context.Context, key string) (GetPulledNarRow
 	var i GetPulledNarRow
 	err := row.Scan(
 		&i.NarinfoKey,
-		&i.FileHash,
-		&i.FileSize,
 		&i.NarSize,
+		&i.NarHash,
+		&i.Compression,
+		&i.Ca,
 	)
 	return i, err
 }
@@ -1043,21 +1045,27 @@ func (q *Queries) UpsertPulledClosure(ctx context.Context, arg UpsertPulledClosu
 }
 
 const upsertPulledNar = `-- name: UpsertPulledNar :exec
-INSERT INTO pulled_nars (key, narinfo_key, file_hash, file_size, nar_size)
-VALUES ($1, $2, $3, $4, $5)
+INSERT INTO pulled_nars (key, narinfo_key, file_hash, file_size, nar_size, nar_hash, compression, ca)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 ON CONFLICT (key) DO UPDATE SET
     narinfo_key = excluded.narinfo_key,
     file_hash = excluded.file_hash,
     file_size = excluded.file_size,
-    nar_size = excluded.nar_size
+    nar_size = excluded.nar_size,
+    nar_hash = excluded.nar_hash,
+    compression = excluded.compression,
+    ca = excluded.ca
 `
 
 type UpsertPulledNarParams struct {
-	Key        string `json:"key"`
-	NarinfoKey string `json:"narinfo_key"`
-	FileHash   string `json:"file_hash"`
-	FileSize   int64  `json:"file_size"`
-	NarSize    int64  `json:"nar_size"`
+	Key         string `json:"key"`
+	NarinfoKey  string `json:"narinfo_key"`
+	FileHash    string `json:"file_hash"`
+	FileSize    int64  `json:"file_size"`
+	NarSize     int64  `json:"nar_size"`
+	NarHash     string `json:"nar_hash"`
+	Compression string `json:"compression"`
+	Ca          string `json:"ca"`
 }
 
 // Remember what a pulled narinfo said about its NAR.
@@ -1068,6 +1076,9 @@ func (q *Queries) UpsertPulledNar(ctx context.Context, arg UpsertPulledNarParams
 		arg.FileHash,
 		arg.FileSize,
 		arg.NarSize,
+		arg.NarHash,
+		arg.Compression,
+		arg.Ca,
 	)
 	return err
 }

@@ -202,6 +202,25 @@ func VerifyNarStreaming(file []byte, chunk int, want NarExpectation) error {
 	return v.finish()
 }
 
+// NarVerifierFailsEarly writes file to a narVerifier without finishing it
+// and reports whether the check says it failed within a second.
+func NarVerifierFailsEarly(file []byte, want NarExpectation) bool {
+	v := newNarVerifier(want.internal())
+	defer func() { _ = v.finish() }()
+
+	_, _ = v.Write(file)
+
+	for range 100 {
+		if v.failure() != nil {
+			return true
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	return false
+}
+
 // TrustedKeysWithSigning is an export of trustedKeysWithSigning for tests.
 func TrustedKeysWithSigning(configured []string, signingKeys []signing.Signer) ([]string, error) {
 	return trustedKeysWithSigning(configured, signingKeys)

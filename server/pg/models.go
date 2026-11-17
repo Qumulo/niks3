@@ -62,9 +62,12 @@ type Pin struct {
 }
 
 type PulledNar struct {
-	Key        string `json:"key"`
-	NarinfoKey string `json:"narinfo_key"`
-	FileHash   string `json:"file_hash"`
-	FileSize   int64  `json:"file_size"`
-	NarSize    int64  `json:"nar_size"`
+	Key         string `json:"key"`
+	NarinfoKey  string `json:"narinfo_key"`
+	FileHash    string `json:"file_hash"`
+	FileSize    int64  `json:"file_size"`
+	NarSize     int64  `json:"nar_size"`
+	NarHash     string `json:"nar_hash"`
+	Compression string `json:"compression"`
+	Ca          string `json:"ca"`
 }
