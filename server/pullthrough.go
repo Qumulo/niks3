@@ -1295,18 +1295,23 @@ func (b *transferBudget) setWriteDeadline(d time.Duration) {
 	}
 }
 
-// progress renews an idle budget. A known-size budget does not move.
+// progress renews an idle budget, at most once per renewal interval. A
+// known-size budget does not move.
 func (b *transferBudget) progress() {
+	if b.idle == 0 || time.Since(b.renewed) < b.renewal {
+		return
+	}
+
+	b.renew()
+}
+
+// renew restarts an idle budget now.
+func (b *transferBudget) renew() {
 	if b.idle == 0 {
 		return
 	}
 
-	now := time.Now()
-	if now.Sub(b.renewed) < b.renewal {
-		return
-	}
-
-	b.renewed = now
+	b.renewed = time.Now()
 	b.timer.Reset(b.idle)
 	b.setWriteDeadline(b.idle)
 }
@@ -1315,20 +1320,28 @@ func (b *transferBudget) stop() {
 	b.timer.Stop()
 }
 
-// reader wraps r so every successful read counts as progress.
+// reader wraps r so every successful read counts as progress. Reaching
+// the end of r renews the budget in full: what is left is the fill's own
+// tail (verifying the NAR, committing it to S3, ending the response),
+// which must not be cut short for the time the last reads took.
 func (b *transferBudget) reader(r io.Reader) io.Reader {
-	return &progressReader{r: r, progress: b.progress}
+	return &progressReader{r: r, progress: b.progress, done: b.renew}
 }
 
 type progressReader struct {
 	r        io.Reader
 	progress func()
+	done     func()
 }
 
 func (p *progressReader) Read(buf []byte) (int, error) {
 	n, err := p.r.Read(buf)
 	if n > 0 {
 		p.progress()
+	}
+
+	if errors.Is(err, io.EOF) {
+		p.done()
 	}
 
 	return n, err //nolint:wrapcheck // transparent wrapper
