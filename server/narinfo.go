@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -23,6 +24,7 @@ type narinfo struct {
 	FileSize    uint64
 	NarHash     string
 	NarSize     uint64
+	CA          string
 	References  []string // store path basenames, without the store dir
 	Sigs        []string
 }
@@ -62,6 +64,8 @@ func parseNarinfo(data []byte) (*narinfo, error) {
 			info.NarHash = value
 		case "NarSize":
 			info.NarSize, err = strconv.ParseUint(value, 10, 64)
+		case "CA":
+			info.CA = value
 		case "References":
 			info.References = strings.Fields(value)
 		case "Sig":
@@ -130,24 +134,51 @@ func (n *narinfo) signingInfo() *signing.NarInfo {
 }
 
 // hashMatches reports whether a raw sha256 digest matches a Nix hash string
-// such as "sha256:<nix-base32>", "sha256:<hex>" or "sha256:<base64>".
-// Anything else never matches.
+// such as "sha256:<nix-base32>", "sha256:<hex>", "sha256:<base64>" or the
+// SRI "sha256-<base64>". Anything else never matches.
 func hashMatches(nixHash string, digest []byte) bool {
+	if encoded, ok := strings.CutPrefix(nixHash, "sha256-"); ok {
+		return len(digest) == sha256.Size && encoded == base64.StdEncoding.EncodeToString(digest)
+	}
+
 	algo, encoded, ok := strings.Cut(nixHash, ":")
-	if !ok || algo != "sha256" {
+	if !ok || algo != "sha256" || len(digest) != sha256.Size {
 		return false
 	}
 
+	return encodedDigestMatches(encoded, digest)
+}
+
+// encodedDigestMatches reports whether encoded, a hash without its
+// algorithm in any of the encodings Nix parses (nix-base32, hex, base64),
+// is digest. The encoding is told apart by its length for the digest's
+// size, as Nix does.
+func encodedDigestMatches(encoded string, digest []byte) bool {
 	switch len(encoded) {
-	case 52:
+	case nixBase32Len(len(digest)):
 		return encoded == encodeNixBase32(digest)
-	case 64:
+	case hex.EncodedLen(len(digest)):
 		return strings.EqualFold(encoded, hex.EncodeToString(digest))
-	case 44:
+	case base64.StdEncoding.EncodedLen(len(digest)):
 		return encoded == base64.StdEncoding.EncodeToString(digest)
 	}
 
 	return false
+}
+
+// validEncodedDigest reports whether encoded has the length of a digest of
+// size bytes in one of the encodings Nix parses.
+func validEncodedDigest(encoded string, size int) bool {
+	switch len(encoded) {
+	case nixBase32Len(size), hex.EncodedLen(size), base64.StdEncoding.EncodedLen(size):
+		return true
+	}
+
+	return false
+}
+
+func nixBase32Len(size int) int {
+	return (size*8-1)/5 + 1
 }
 
 // encodeNixBase32 encodes bytes in Nix's base32 (src/libutil/base-nix-32.cc).
@@ -157,7 +188,7 @@ func encodeNixBase32(input []byte) string {
 		return ""
 	}
 
-	length := (len(input)*8-1)/5 + 1
+	length := nixBase32Len(len(input))
 	result := make([]byte, 0, length)
 
 	for n := length - 1; n >= 0; n-- {
