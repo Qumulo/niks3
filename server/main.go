@@ -5,11 +5,13 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Mic92/niks3/server/pg"
 	minio "github.com/minio/minio-go/v7"
 )
 
@@ -88,6 +90,20 @@ func readSecretFile(path string) (string, error) {
 	}
 
 	return strings.TrimSpace(string(content)), nil
+}
+
+func dbMaxConnsUsage() string {
+	return fmt.Sprintf("Maximum size of the database connection pool. "+
+		"0 takes pool_max_conns from the connection string, or else one connection per core up to %d", pg.DefaultMaxConns)
+}
+
+// parseDBMaxConns checks --db-max-conns, which pgx takes as an int32.
+func parseDBMaxConns(n int) (int32, error) {
+	if n < 0 || n > math.MaxInt32 {
+		return 0, fmt.Errorf("--db-max-conns must be between 0 and %d", math.MaxInt32)
+	}
+
+	return int32(n), nil
 }
 
 // resolveDBConnectionString returns "" when PG* variables are set. pgx reads
@@ -280,6 +296,7 @@ func parseArgs() (*options, error) {
 	maxNarSize := ""
 
 	dbFile := ""
+	dbMaxConns := 0
 	s3AccessKeyPath := ""
 	s3SecretKeyPath := ""
 	apiTokenPath := ""
@@ -290,6 +307,7 @@ func parseArgs() (*options, error) {
 			"When empty, libpq PG* environment variables are used")
 	flag.StringVar(&dbFile, "db-file", getEnvOrDefault("NIKS3_DB_FILE", ""),
 		"Path to file containing the Postgres connection string (e.g. a mounted Kubernetes secret)")
+	flag.IntVar(&dbMaxConns, "db-max-conns", getEnvOrDefaultInt("NIKS3_DB_MAX_CONNS", 0), dbMaxConnsUsage())
 	flag.StringVar(&opts.HTTPAddr, "http-addr", getEnvOrDefault("NIKS3_HTTP_ADDR", ":5751"), "HTTP address to listen on")
 	flag.StringVar(&opts.S3Endpoint, "s3-endpoint", getEnvOrDefault("NIKS3_S3_ENDPOINT", ""), "S3 endpoint")
 	flag.StringVar(&opts.S3PublicURL, "s3-public-url", getEnvOrDefault("NIKS3_S3_PUBLIC_URL", ""),
@@ -375,6 +393,10 @@ func parseArgs() (*options, error) {
 	var err error
 
 	if opts.DBConnectionString, err = resolveDBConnectionString(opts.DBConnectionString, dbFile, os.LookupEnv); err != nil {
+		return nil, err
+	}
+
+	if opts.DBMaxConns, err = parseDBMaxConns(dbMaxConns); err != nil {
 		return nil, err
 	}
 

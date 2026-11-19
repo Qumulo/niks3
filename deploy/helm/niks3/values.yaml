@@ -14,6 +14,10 @@ database:
   secretKey: uri
   # Or inline. The chart creates the Secret.
   url: ""
+  # Size of each replica's connection pool. 0 lets niks3 choose: one per core,
+  # at most 32. Replicas, twice over during a rolling update, must fit in
+  # Postgres's max_connections.
+  maxConns: 0
 s3:
   # host[:port] the server talks to. Clients upload via presigned URLs, so this
   # must also be reachable from wherever `niks3 push` runs unless publicURL is set.

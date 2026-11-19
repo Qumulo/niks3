@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -21,8 +22,39 @@ func TestConnectToAMigratedDatabase(t *testing.T) {
 	connString := createTestDatabase(t)
 
 	for range 2 {
-		pool, err := pg.Connect(t.Context(), connString)
+		pool, err := pg.Connect(t.Context(), connString, 0)
 		ok(t, err)
+		pool.Close()
+	}
+}
+
+// The pool is sized by the caller, else by the connection string, else by
+// pgx's default capped at pg.DefaultMaxConns.
+func TestConnectPoolSize(t *testing.T) {
+	t.Parallel()
+
+	connString := createTestDatabase(t)
+	pgxDefault := max(4, runtime.NumCPU())
+
+	tests := []struct {
+		name       string
+		connString string
+		maxConns   int32
+		want       int
+	}{
+		{name: "default", connString: connString, want: min(pgxDefault, pg.DefaultMaxConns)},
+		{name: "connection string", connString: connString + "&pool_max_conns=50", want: 50},
+		{name: "caller", connString: connString + "&pool_max_conns=50", maxConns: 7, want: 7},
+	}
+
+	for _, tt := range tests {
+		pool, err := pg.Connect(t.Context(), tt.connString, tt.maxConns)
+		ok(t, err)
+
+		if got := int(pool.Config().MaxConns); got != tt.want {
+			t.Errorf("%s: MaxConns = %d, want %d", tt.name, got, tt.want)
+		}
+
 		pool.Close()
 	}
 }
@@ -104,7 +136,7 @@ func TestConnectWaitsForAPeerMigration(t *testing.T) {
 	go func() {
 		defer close(done)
 
-		pool, connErr = pg.Connect(ctx, connString)
+		pool, connErr = pg.Connect(ctx, connString, 0)
 	}()
 
 	// Run out the budget only once Connect waits, so a slow connection on a

@@ -211,6 +211,10 @@ let
     "--api-token-path"
     (toString cfg.apiTokenFile)
   ]
+  ++ lib.optionals (cfg.database.maxConns != null) [
+    "--db-max-conns"
+    (toString cfg.database.maxConns)
+  ]
   ++ lib.optionals (cfg.s3.region != "") [
     "--s3-region"
     cfg.s3.region
@@ -345,6 +349,17 @@ in
         description = ''
           Whether to create the database locally.
           This will create a PostgreSQL database named 'niks3' with a user 'niks3'.
+        '';
+      };
+
+      maxConns = lib.mkOption {
+        type = lib.types.nullOr lib.types.ints.positive;
+        default = null;
+        example = 16;
+        description = ''
+          Size of the database connection pool.
+          When null, the connection string's pool_max_conns sizes it, or else
+          niks3 opens one connection per core, at most 32.
         '';
       };
     };

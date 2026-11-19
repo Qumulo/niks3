@@ -40,6 +40,10 @@
         },
         "url": {
           "type": "string"
+        },
+        "maxConns": {
+          "type": "integer",
+          "minimum": 0
         }
       },
       "additionalProperties": false

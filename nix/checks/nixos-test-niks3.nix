@@ -54,6 +54,7 @@ testers.nixosTest {
         services.niks3 = {
           enable = true;
           httpAddr = "0.0.0.0:5751";
+          database.maxConns = 16;
 
           s3 = common.s3 // {
             endpoint = "server:9000";
@@ -210,6 +211,9 @@ testers.nixosTest {
     server.wait_for_open_port(5751)
     server.wait_for_open_port(8080)
     server.wait_for_open_port(9000)
+
+    # database.maxConns reaches the server as --db-max-conns.
+    server.succeed("journalctl -u niks3.service | grep -q 'Database connection pool max_conns=16'")
 
     # Create auth token file for testing
     server.succeed("mkdir -p /tmp/test-config")

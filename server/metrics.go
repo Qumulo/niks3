@@ -10,6 +10,7 @@ import (
 
 	"github.com/Mic92/niks3/api"
 	"github.com/Mic92/niks3/server/pg"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -223,6 +224,26 @@ func methodLabel(method string) string {
 // Handler serves the metrics in the Prometheus text format.
 func (m *Metrics) Handler() http.Handler {
 	return promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{})
+}
+
+// ObservePool exports how long requests wait for a database connection,
+// read from pool at each scrape. A pool at its size makes requests queue
+// rather than fail; these counters show the queue.
+func (m *Metrics) ObservePool(pool *pgxpool.Pool) {
+	m.registry.MustRegister(
+		prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Name: "niks3_db_acquire_waits_total",
+			Help: "Database connection acquires that found no idle connection and waited for one to be released or opened.",
+		}, func() float64 { return float64(pool.Stat().EmptyAcquireCount()) }),
+		prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Name: "niks3_db_acquire_wait_seconds_total",
+			Help: "Time acquires that found no idle connection spent waiting for one.",
+		}, func() float64 { return pool.Stat().EmptyAcquireWaitTime().Seconds() }),
+		prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Name: "niks3_db_acquires_canceled_total",
+			Help: "Database connection acquires abandoned because their request ended before a connection was free.",
+		}, func() float64 { return float64(pool.Stat().CanceledAcquireCount()) }),
+	)
 }
 
 // recordPullThrough counts one read proxy request for a pull-through kind.

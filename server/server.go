@@ -27,7 +27,9 @@ import (
 
 type options struct {
 	DBConnectionString string
-	HTTPAddr           string
+	// DBMaxConns sizes the database pool; 0 leaves it to pg.Connect.
+	DBMaxConns int32
+	HTTPAddr   string
 
 	S3Endpoint string
 	// S3PublicURL, when set, is the externally reachable S3 base URL
@@ -275,7 +277,7 @@ func runServer(opts *options) error { //nolint:maintidx // one linear startup se
 	ctx, cancel := context.WithTimeout(context.Background(), dbConnectionTimeout)
 	defer cancel()
 
-	pool, err := pg.Connect(ctx, opts.DBConnectionString)
+	pool, err := pg.Connect(ctx, opts.DBConnectionString, opts.DBMaxConns)
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
@@ -392,6 +394,7 @@ func runServer(opts *options) error { //nolint:maintidx // one linear startup se
 	metricsCtx, stopMetrics := context.WithCancel(context.Background())
 	defer stopMetrics()
 	service.StartInventoryRefresh(metricsCtx)
+	service.Metrics.ObservePool(pool)
 
 	streams, stopStreams := context.WithCancel(context.Background())
 	service.Streams = streams

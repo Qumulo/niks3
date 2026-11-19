@@ -52,7 +52,7 @@ func createTestService(tb testing.TB) *server.Service {
 	ctx, cancel := context.WithTimeout(tb.Context(), testwait.Hung)
 	defer cancel()
 
-	pool, err := pg.Connect(ctx, connectionString)
+	pool, err := pg.Connect(ctx, connectionString, 0)
 	if err != nil {
 		ok(tb, err)
 	}

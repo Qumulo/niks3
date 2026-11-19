@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
@@ -16,17 +17,35 @@ import (
 //go:embed migrations/*.sql functions/*.sql
 var embedMigrations embed.FS
 
+// DefaultMaxConns caps the pool when neither the caller nor the connection
+// string sizes it. pgx would open one connection per core, 192 on a large
+// node, while Postgres allows 100 by default. Two servers must fit, as during
+// a rolling update, or the new one cannot open a connection at all.
+const DefaultMaxConns = 32
+
 // Connect opens a pool on connString and brings the schema up to date.
+//
+// maxConns sizes the pool when it is above zero. Otherwise the connection
+// string's pool_max_conns does, and without one pgx's size, capped at
+// DefaultMaxConns.
 //
 // A goose Provider avoids the package-level goose globals, which race, and
 // its session lock serialises replicas starting against one database.
 //
 // ctx bounds reaching the database, not migrating it, so a slow migration
 // cannot fail every restart.
-func Connect(ctx context.Context, connString string) (*pgxpool.Pool, error) {
+func Connect(ctx context.Context, connString string, maxConns int32) (*pgxpool.Pool, error) {
 	slog.Debug("connecting to database", "connection_string", connString)
 
-	pool, err := pgxpool.New(ctx, connString)
+	config, err := pgxpool.ParseConfig(connString)
+	if err != nil {
+		return nil, fmt.Errorf("unable to connect to database: %w", err)
+	}
+
+	config.MaxConns = poolMaxConns(config.MaxConns, connString, maxConns)
+	slog.Info("Database connection pool", "max_conns", config.MaxConns)
+
+	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		return nil, fmt.Errorf("unable to connect to database: %w", err)
 	}
@@ -44,6 +63,19 @@ func Connect(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 	}
 
 	return pool, nil
+}
+
+// poolMaxConns picks the pool size. parsed is what pgx read from connString,
+// its default when the string names none.
+func poolMaxConns(parsed int32, connString string, maxConns int32) int32 {
+	switch {
+	case maxConns > 0:
+		return maxConns
+	case strings.Contains(connString, "pool_max_conns"):
+		return parsed
+	default:
+		return min(parsed, DefaultMaxConns)
+	}
 }
 
 func migrate(ctx context.Context, pool *pgxpool.Pool) error {

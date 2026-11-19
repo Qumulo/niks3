@@ -37,6 +37,7 @@ func TestMetricsInventory(t *testing.T) {
 	commitOK(t)(queries.CommitPendingClosure(ctx, pendingClosure.ID))
 
 	ok(t, service.RefreshInventory(ctx))
+	service.Metrics.ObservePool(service.Pool)
 
 	// Drive a request through the middleware so the HTTP metrics populate.
 	mux := http.NewServeMux()
@@ -70,6 +71,9 @@ func TestMetricsInventory(t *testing.T) {
 		"niks3_cache_logical_bytes 4096",
 		"niks3_pending_closures 0",
 		"niks3_db_connections_max",
+		"niks3_db_acquire_waits_total",
+		"niks3_db_acquire_wait_seconds_total",
+		"niks3_db_acquires_canceled_total",
 		`niks3_http_requests_total{method="GET",route="GET /health",status="200"} 1`,
 		`niks3_http_requests_total{method="other",route="unmatched",status="405"} 3`,
 	} {
